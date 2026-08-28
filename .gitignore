@@ -1,0 +1,14 @@
+# Rust build artifacts
+target/
+*.bin
+
+# Large mock / test FITS files
+*.fits
+*.fits.gz
+*.reg
+
+# Editor and OS
+.DS_Store
+.vscode/
+.idea/
+*.swp

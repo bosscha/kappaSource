@@ -56,7 +56,7 @@ pub struct ExtractCli {
     #[arg(long, default_value_t = true)]
     pub save_regions: bool,
 
-    /// Also generate an ASCII / CSV text catalog (.cat and .csv)
+    /// Also generate ASCII / CSV text catalogs (.cat and .csv)
     #[arg(long, default_value_t = true)]
     pub save_ascii: bool,
 }
@@ -595,6 +595,32 @@ fn write_csv_catalog(
     Ok(())
 }
 
+/// Write constituent subcomponents table to ASCII (.subcomponents.cat)
+fn write_subcomponents_ascii_catalog(
+    path: &Path,
+    input_filename: &str,
+    timestamp: &str,
+    sources: &[Source],
+) -> std::io::Result<()> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    writeln!(writer, "# ==============================================================================")?;
+    writeln!(writer, "# Constituent Subcomponents Peak Catalog")?;
+    writeln!(writer, "# Input FITS File : {}", input_filename)?;
+    writeln!(writer, "# Extraction Date : {}", timestamp)?;
+    writeln!(writer, "# Total Peaks     : {}", sources.len())?;
+    writeln!(writer, "# ==============================================================================")?;
+    writeln!(writer, "#{:<7} {:<10} {:<10} {:<12} {:<12} {:<10} {:<6}",
+        "PEAK_ID", "X", "Y", "FLUX", "AMPLITUDE", "KAPPA_ID", "KAPPA")?;
+    writeln!(writer, "# ------------------------------------------------------------------------------")?;
+
+    for s in sources {
+        writeln!(writer, "{:<8} {:<10.3} {:<10.3} {:<12.4} {:<12.4} {:<10} {:<6}",
+            s.id, s.x, s.y, s.flux, s.amplitude, s.kappa_id, s.kappa)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 /// Write DS9 region file for visual validation
 fn write_ds9_regions(path: &Path, kappa_sources: &[KappaSource], sources: &[Source]) -> std::io::Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
@@ -667,11 +693,11 @@ fn fits_str_val(s: &str) -> String {
     format!("'{:<8}'", s)
 }
 
-/// Write extracted kappa-sources catalog to FITS binary table
+/// Write extracted kappa-sources catalog and constituent sources to FITS binary table
 fn write_extracted_fits_catalog(
     path: &Path,
     kappa_sources: &[KappaSource],
-    _sources: &[Source],
+    sources: &[Source],
     bg_median: f32,
     bg_rms: f32,
     beam_flux_rms: f32,
@@ -701,7 +727,7 @@ fn write_extracted_fits_catalog(
     p_bytes.resize(p_len + p_pad, b' ');
     writer.write_all(&p_bytes)?;
 
-    // Extension: KAPPA_SRCS
+    // Extension 1: KAPPA_SRCS
     let num_kappa = kappa_sources.len();
     let row_size = 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4; // 36 bytes
 
@@ -733,7 +759,7 @@ fn write_extracted_fits_catalog(
     ext_cards.push(make_fits_card("TTYPE5", &fits_str_val("TOTAL_FLUX"), Some("Total collective flux")));
     ext_cards.push(make_fits_card("TFORM5", &fits_str_val("1E"), Some("32-bit float")));
 
-    ext_cards.push(make_fits_card("TTYPE6", &fits_str_val("MAX_AMP"), Some("Max member peak amplitude")));
+    ext_cards.push(make_fits_card("TTYPE6", &fits_val_cut("MAX_AMP"), Some("Max member peak amplitude")));
     ext_cards.push(make_fits_card("TFORM6", &fits_str_val("1E"), Some("32-bit float")));
 
     ext_cards.push(make_fits_card("TTYPE7", &fits_str_val("RADIUS"), Some("Spatial extent radius (px)")));
@@ -774,8 +800,76 @@ fn write_extracted_fits_catalog(
     table_bytes.resize(t_len + t_pad, 0u8);
     writer.write_all(&table_bytes)?;
 
+    // Extension 2: SOURCES (Constituent subcomponents)
+    let num_srcs = sources.len();
+    let src_row_size = 4 + 4 + 4 + 4 + 4 + 4 + 4; // 28 bytes
+
+    let mut s_cards = Vec::new();
+    s_cards.push(make_fits_card("XTENSION", &fits_str_val("BINTABLE"), Some("binary table extension")));
+    s_cards.push(make_fits_card("BITPIX", "8", Some("8-bit bytes")));
+    s_cards.push(make_fits_card("NAXIS", "2", Some("2-dimensional table")));
+    s_cards.push(make_fits_card("NAXIS1", &src_row_size.to_string(), Some("width of table row in bytes")));
+    s_cards.push(make_fits_card("NAXIS2", &num_srcs.to_string(), Some("number of rows in table")));
+    s_cards.push(make_fits_card("PCOUNT", "0", Some("size of special data area")));
+    s_cards.push(make_fits_card("GCOUNT", "1", Some("one data group")));
+    s_cards.push(make_fits_card("TFIELDS", "7", Some("number of fields per row")));
+    s_cards.push(make_fits_card("EXTNAME", &fits_str_val("SOURCES"), Some("Constituent subcomponent peaks")));
+
+    s_cards.push(make_fits_card("TTYPE1", &fits_str_val("ID"), Some("Peak subcomponent ID")));
+    s_cards.push(make_fits_card("TFORM1", &fits_str_val("1J"), Some("32-bit integer")));
+
+    s_cards.push(make_fits_card("TTYPE2", &fits_str_val("X"), Some("X position in pixels")));
+    s_cards.push(make_fits_card("TFORM2", &fits_str_val("1E"), Some("32-bit float")));
+    s_cards.push(make_fits_card("TUNIT2", &fits_str_val("pixel"), None));
+
+    s_cards.push(make_fits_card("TTYPE3", &fits_str_val("Y"), Some("Y position in pixels")));
+    s_cards.push(make_fits_card("TFORM3", &fits_str_val("1E"), Some("32-bit float")));
+    s_cards.push(make_fits_card("TUNIT3", &fits_str_val("pixel"), None));
+
+    s_cards.push(make_fits_card("TTYPE4", &fits_str_val("FLUX"), Some("Matched filter point flux")));
+    s_cards.push(make_fits_card("TFORM4", &fits_str_val("1E"), Some("32-bit float")));
+
+    s_cards.push(make_fits_card("TTYPE5", &fits_str_val("AMPLITUDE"), Some("Peak amplitude")));
+    s_cards.push(make_fits_card("TFORM5", &fits_str_val("1E"), Some("32-bit float")));
+
+    s_cards.push(make_fits_card("TTYPE6", &fits_str_val("KAPPA_ID"), Some("Parent kappa-source ID (0 if none)")));
+    s_cards.push(make_fits_card("TFORM6", &fits_str_val("1J"), Some("32-bit integer")));
+
+    s_cards.push(make_fits_card("TTYPE7", &fits_str_val("KAPPA"), Some("Parent kappa multiplicity")));
+    s_cards.push(make_fits_card("TFORM7", &fits_str_val("1J"), Some("32-bit integer")));
+
+    s_cards.push(make_fits_card("END", "", None));
+
+    let mut s_bytes = Vec::new();
+    for c in s_cards {
+        s_bytes.extend_from_slice(c.as_bytes());
+    }
+    let s_len = s_bytes.len();
+    let s_pad = (2880 - (s_len % 2880)) % 2880;
+    s_bytes.resize(s_len + s_pad, b' ');
+    writer.write_all(&s_bytes)?;
+
+    let mut s_table_bytes = Vec::with_capacity(num_srcs * src_row_size + 2880);
+    for s in sources {
+        s_table_bytes.extend_from_slice(&(s.id as i32).to_be_bytes());
+        s_table_bytes.extend_from_slice(&s.x.to_be_bytes());
+        s_table_bytes.extend_from_slice(&s.y.to_be_bytes());
+        s_table_bytes.extend_from_slice(&s.flux.to_be_bytes());
+        s_table_bytes.extend_from_slice(&s.amplitude.to_be_bytes());
+        s_table_bytes.extend_from_slice(&(s.kappa_id as i32).to_be_bytes());
+        s_table_bytes.extend_from_slice(&(s.kappa as i32).to_be_bytes());
+    }
+    let st_len = s_table_bytes.len();
+    let st_pad = (2880 - (st_len % 2880)) % 2880;
+    s_table_bytes.resize(st_len + st_pad, 0u8);
+    writer.write_all(&s_table_bytes)?;
+
     writer.flush()?;
     Ok(())
+}
+
+fn fits_val_cut(s: &str) -> String {
+    fits_str_val(s)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -869,10 +963,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.save_ascii {
         let cat_path = parent_dir.join(format!("{}_{}.extracted.cat", input_stem, timestamp));
         let csv_path = parent_dir.join(format!("{}_{}.extracted.csv", input_stem, timestamp));
-        println!("Writing ASCII catalog to {}...", cat_path.display());
+        let sub_cat_path = parent_dir.join(format!("{}_{}.extracted.subcomponents.cat", input_stem, timestamp));
+
+        println!("Writing ASCII kappa-sources catalog to {}...", cat_path.display());
         write_ascii_catalog(&cat_path, input_filename, &timestamp, &kappa_sources, bg_median, bg_rms, beam_flux_rms, args.detection_sigma)?;
-        println!("Writing CSV catalog to {}...", csv_path.display());
+
+        println!("Writing CSV kappa-sources catalog to {}...", csv_path.display());
         write_csv_catalog(&csv_path, &kappa_sources)?;
+
+        println!("Writing constituent subcomponents catalog to {}...", sub_cat_path.display());
+        write_subcomponents_ascii_catalog(&sub_cat_path, input_filename, &timestamp, &sources)?;
     }
 
     // 7. Save DS9 region overlays
@@ -886,6 +986,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("Extraction complete! Successfully created timestamped catalog for {}.", args.input.display());
+    println!("Extraction complete! Successfully created timestamped catalogs for {}.", args.input.display());
     Ok(())
 }

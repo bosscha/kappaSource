@@ -10,9 +10,10 @@ use rand::{Rng, SeedableRng};
 use rand_distr::Normal;
 use rayon::prelude::*;
 
+use kappa::psf::{Psf, PsfType};
 use kappa::{generate_n_kappa_sources, print_kappa_summary, KappaSource, Source};
 
-/// Generate an M x M mock FITS image containing N kappa-sources with kappa <= max_kappa and max radius.
+/// Generate an M x M mock FITS image containing N kappa-sources convolved by telescope PSF.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
@@ -36,6 +37,18 @@ pub struct Cli {
     #[arg(short = 'r', long, default_value_t = 25.0)]
     pub max_radius: f32,
 
+    /// Point Spread Function (PSF) model type: "gaussian" or "moffat"
+    #[arg(long, default_value = "gaussian")]
+    pub psf: String,
+
+    /// Full Width at Half Maximum (FWHM) of the PSF in pixels
+    #[arg(long, default_value_t = 10.0)]
+    pub fwhm: f32,
+
+    /// Power-law index beta for Moffat PSF (standard atmospheric seeing is ~4.765)
+    #[arg(long, default_value_t = 4.765)]
+    pub moffat_beta: f32,
+
     /// Detection threshold for total collective flux in units of noise RMS (e.g. 3.0 for 3xRMS)
     #[arg(short = 's', long, default_value_t = 3.0)]
     pub detection_sigma: f32,
@@ -51,10 +64,6 @@ pub struct Cli {
     /// Background mean
     #[arg(long, default_value_t = 0.0)]
     pub noise_mean: f32,
-
-    /// Full Width at Half Maximum (FWHM) of Gaussian point sources in pixels
-    #[arg(long, default_value_t = 10.0)]
-    pub fwhm: f32,
 
     /// Standard deviation in log(flux) for flux variations across subcomponents
     #[arg(long, default_value_t = 0.3)]
@@ -119,9 +128,9 @@ pub fn write_fits_image_with_kappa(
     height: usize,
     sources: &[Source],
     kappa_sources: &[KappaSource],
+    psf: &Psf,
     noise_mean: f32,
     noise_sigma: f32,
-    fwhm: f32,
     peak_flux_mode: bool,
     max_source_sigma: f32,
     max_kappa: usize,
@@ -142,11 +151,25 @@ pub fn write_fits_image_with_kappa(
     cards.push(make_fits_card("NAXIS2", &height.to_string(), Some("length of data axis 2 (M)")));
     cards.push(make_fits_card("EXTEND", "T", Some("FITS dataset contains extensions")));
 
-    cards.push(make_fits_card("COMMENT", "", Some("Mock FITS image of N kappa-sources on M x M grid")));
+    cards.push(make_fits_card("COMMENT", "", Some("Mock FITS image of N kappa-sources convolved by PSF")));
     cards.push(make_fits_card("BG_MEAN", &format!("{:.6}", noise_mean), Some("Background noise mean")));
     cards.push(make_fits_card("BG_SIGMA", &format!("{:.6}", noise_sigma), Some("Background noise RMS (sigma)")));
     cards.push(make_fits_card("NSRC", &sources.len().to_string(), Some("Total constituent point sources")));
-    cards.push(make_fits_card("SRC_FWHM", &format!("{:.4}", fwhm), Some("Point source FWHM in pixels")));
+
+    // PSF Convolution Metadata
+    let psf_str = match psf.psf_type {
+        PsfType::Gaussian => "GAUSSIAN",
+        PsfType::Moffat => "MOFFAT",
+    };
+    cards.push(make_fits_card("CONVOLV", "T", Some("Each subcomponent is convolved by PSF")));
+    cards.push(make_fits_card("PSF_TYPE", &fits_str_val(psf_str), Some("Point Spread Function model")));
+    cards.push(make_fits_card("PSF_FWHM", &format!("{:.4}", psf.fwhm), Some("PSF FWHM in pixels")));
+    cards.push(make_fits_card("PSF_SIG", &format!("{:.4}", psf.sigma), Some("PSF Gaussian sigma equivalent (px)")));
+    cards.push(make_fits_card("PSF_NORM", "1.000000", Some("PSF 2D integral normalized to 1.0")));
+    if psf.psf_type == PsfType::Moffat {
+        cards.push(make_fits_card("MOF_BETA", &format!("{:.4}", psf.moffat_beta), Some("Moffat beta index")));
+    }
+
     cards.push(make_fits_card("SRC_PEAK", if peak_flux_mode { "T" } else { "F" }, Some("T if flux is peak amplitude")));
     if max_source_sigma > 0.0 {
         cards.push(make_fits_card("SRC_MAXS", &format!("{:.2}", max_source_sigma), Some("Max source peak in noise sigma units")));
@@ -212,14 +235,14 @@ pub fn write_fits_image_with_kappa(
     ext1_cards.push(make_fits_card("TTYPE4", &fits_str_val("FLUX"), Some("Point source flux")));
     ext1_cards.push(make_fits_card("TFORM4", &fits_str_val("1E"), Some("32-bit float")));
 
-    ext1_cards.push(make_fits_card("TTYPE5", &fits_str_val("AMPLITUDE"), Some("Gaussian peak amplitude")));
+    ext1_cards.push(make_fits_card("TTYPE5", &fits_str_val("AMPLITUDE"), Some("Convolved peak amplitude")));
     ext1_cards.push(make_fits_card("TFORM5", &fits_str_val("1E"), Some("32-bit float")));
 
-    ext1_cards.push(make_fits_card("TTYPE6", &fits_str_val("SIGMA"), Some("Gaussian sigma in pixels")));
+    ext1_cards.push(make_fits_card("TTYPE6", &fits_str_val("SIGMA"), Some("PSF sigma in pixels")));
     ext1_cards.push(make_fits_card("TFORM6", &fits_str_val("1E"), Some("32-bit float")));
     ext1_cards.push(make_fits_card("TUNIT6", &fits_str_val("pixel"), None));
 
-    ext1_cards.push(make_fits_card("TTYPE7", &fits_str_val("FWHM"), Some("FWHM in pixels")));
+    ext1_cards.push(make_fits_card("TTYPE7", &fits_str_val("FWHM"), Some("PSF FWHM in pixels")));
     ext1_cards.push(make_fits_card("TFORM7", &fits_str_val("1E"), Some("32-bit float")));
     ext1_cards.push(make_fits_card("TUNIT7", &fits_str_val("pixel"), None));
 
@@ -398,15 +421,21 @@ pub fn write_ds9_regions_by_kappa(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Cli::parse();
 
+    let psf = match args.psf.to_lowercase().as_str() {
+        "moffat" => Psf::new_moffat(args.fwhm, args.moffat_beta),
+        _ => Psf::new_gaussian(args.fwhm),
+    };
+
     println!("==============================================================================");
-    println!("N kappa-Sources FITS Generator (M x M Grid)");
+    println!("N kappa-Sources FITS Generator with PSF Convolution (M x M Grid)");
     println!("==============================================================================");
     println!("Image Grid (M x M)       : {} x {} pixels", args.size, args.size);
     println!("Target kappa-Sources     : N = {}", args.num_kappa);
     println!("Multiplicity Range       : 1 <= kappa <= {}", args.max_kappa);
     println!("Max Cluster Radius       : <= {:.1} pixels", args.max_radius);
+    println!("PSF Model                : {:?} (FWHM = {:.1} px, sigma = {:.4} px)", 
+        psf.psf_type, psf.fwhm, psf.sigma);
     println!("Gaussian Noise (RMS)     : mean = {}, sigma = {}", args.noise_mean, args.noise_sigma);
-    println!("Point Source FWHM        : {} px", args.fwhm);
     println!("Detection Threshold      : Total Collective Flux >= {:.2} * RMS ({:.4})", 
         args.detection_sigma, args.detection_sigma * args.noise_sigma);
     println!("Subcomponent Limit       : Subcomponent Flux < {:.2} * RMS ({:.4}) for kappa>=2", 
@@ -450,7 +479,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.size,
         args.max_kappa,
         args.max_radius,
-        args.fwhm,
+        &psf,
         args.detection_sigma,
         args.subcomponent_max_sigma,
         args.flux_sigma,
@@ -460,10 +489,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut source_rng,
     );
 
-    // 3. Render constituent point sources onto the image
-    println!("Rendering {} constituent point sources...", sources.len());
+    // 3. Convolve each subcomponent by the telescope PSF onto the image raster
+    println!("Convolving {} constituent point sources with {:?} PSF (FWHM={:.1} px)...", 
+        sources.len(), psf.psf_type, psf.fwhm);
     for source in &sources {
-        source.render(&mut image, args.size, args.size);
+        source.render_convolved(&psf, &mut image, args.size, args.size);
     }
 
     // 4. Print detailed kappa summary table
@@ -478,9 +508,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.size,
         &sources,
         &kappa_sources,
+        &psf,
         args.noise_mean,
         args.noise_sigma,
-        args.fwhm,
         args.peak_flux,
         args.max_source_sigma,
         args.max_kappa,
@@ -497,7 +527,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_ds9_regions_by_kappa(&reg_path, &sources, &kappa_sources)?;
     }
 
-    println!("Done! Successfully created mock FITS image with {} kappa-sources on {}x{} grid.", 
+    println!("Done! Successfully created mock FITS image with {} kappa-sources convolved by PSF on {}x{} grid.", 
         kappa_sources.len(), args.size, args.size);
     Ok(())
 }

@@ -1,10 +1,14 @@
+#[path = "psf.rs"]
+pub mod psf;
+
 use std::collections::HashMap;
+use self::psf::Psf;
 use rand::distributions::Distribution;
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand_distr::LogNormal;
 
-/// Gaussian point source properties
+/// Gaussian/PSF-convolved point source properties
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub struct Source {
@@ -21,31 +25,9 @@ pub struct Source {
 
 #[allow(dead_code)]
 impl Source {
-    /// Render source contribution into the image buffer within a 5-sigma bounding box
-    pub fn render(&self, image: &mut [f32], width: usize, height: usize) {
-        let radius = (5.0 * self.sigma).ceil() as isize;
-        let x_center = self.x.round() as isize;
-        let y_center = self.y.round() as isize;
-
-        let x_min = (x_center - radius).max(0) as usize;
-        let x_max = ((x_center + radius).min(width as isize - 1)) as usize;
-        let y_min = (y_center - radius).max(0) as usize;
-        let y_max = ((y_center + radius).min(height as isize - 1)) as usize;
-
-        let two_sigma_sq = 2.0 * self.sigma * self.sigma;
-
-        for y in y_min..=y_max {
-            let dy = y as f32 - self.y;
-            let dy_sq = dy * dy;
-            let row_offset = y * width;
-
-            for x in x_min..=x_max {
-                let dx = x as f32 - self.x;
-                let dist_sq = dx * dx + dy_sq;
-                let val = self.amplitude * (-dist_sq / two_sigma_sq).exp();
-                image[row_offset + x] += val;
-            }
-        }
+    /// Render source contribution into the image buffer by convolving with the telescope PSF
+    pub fn render_convolved(&self, psf: &Psf, image: &mut [f32], width: usize, height: usize) {
+        psf.convolve_point_source(self.x, self.y, self.flux, image, width, height);
     }
 }
 
@@ -66,7 +48,7 @@ pub struct KappaSource {
     pub centroid_y: f32,
     /// Total integrated flux (sum of member fluxes)
     pub total_flux: f32,
-    /// Maximum peak amplitude among member sources
+    /// Maximum peak amplitude among member sources after PSF convolution
     pub max_amplitude: f32,
     /// Spatial extent / characteristic bounding radius in pixels
     pub radius: f32,
@@ -82,6 +64,7 @@ pub struct KappaSource {
 /// - Total collective flux >= detection_sigma * noise_sigma (default: 3.0 * RMS)
 /// - For kappa >= 2: Every individual subcomponent flux < subcomponent_max_sigma * noise_sigma
 /// - For kappa = 1: Single source flux >= detection_sigma * noise_sigma
+/// - Each subcomponent is convolved by the telescope PSF
 #[allow(dead_code)]
 pub fn generate_n_kappa_sources(
     num_kappa_sources: usize,
@@ -89,7 +72,7 @@ pub fn generate_n_kappa_sources(
     height: usize,
     max_kappa: usize,
     max_radius: f32,
-    fwhm: f32,
+    psf: &Psf,
     detection_sigma: f32,
     subcomponent_max_sigma: f32,
     flux_sigma: f32,
@@ -98,11 +81,10 @@ pub fn generate_n_kappa_sources(
     noise_sigma: f32,
     rng: &mut StdRng,
 ) -> (Vec<Source>, Vec<KappaSource>) {
-    let sigma = fwhm / (2.0 * (2.0 * 2.0f32.ln()).sqrt());
-    let area = 2.0 * std::f32::consts::PI * sigma * sigma;
-
     let min_detection_flux = detection_sigma * noise_sigma;
     let sub_max_flux_limit = subcomponent_max_sigma * noise_sigma;
+
+    let psf_peak_factor = psf.peak_response();
 
     let max_allowed_amplitude = if max_source_sigma > 0.0 {
         Some(max_source_sigma * noise_sigma)
@@ -116,7 +98,7 @@ pub fn generate_n_kappa_sources(
         None
     };
 
-    let margin = (max_radius + fwhm * 2.0).max(50.0);
+    let margin = (max_radius + psf.fwhm * 2.0).max(50.0);
     let effective_max_k = max_kappa.max(1);
 
     let mut all_sources: Vec<Source> = Vec::new();
@@ -166,9 +148,6 @@ pub fn generate_n_kappa_sources(
         let fluxes: Vec<f32> = if kappa == 1 {
             vec![total_target_flux]
         } else {
-            // Generate kappa subcomponents such that:
-            // 1. sum(fluxes) = total_target_flux
-            // 2. each flux < sub_max_flux_limit (and < total_target_flux)
             let max_allowed_sub_flux = sub_max_flux_limit.min(total_target_flux * 0.95);
 
             let mut weights: Vec<f32> = (0..kappa)
@@ -188,7 +167,7 @@ pub fn generate_n_kappa_sources(
 
             let mut sub_fluxes: Vec<f32> = weights.iter().map(|&w| w * total_target_flux).collect();
 
-            // Enforce that every subcomponent is below sub_max_flux_limit
+            // Enforce that every subcomponent is strictly below sub_max_flux_limit
             for _ in 0..20 {
                 let mut excess = 0.0f32;
                 let mut valid_count = 0;
@@ -214,7 +193,7 @@ pub fn generate_n_kappa_sources(
             sub_fluxes
         };
 
-        // Build member point sources
+        // Build member point sources to be convolved by PSF
         let mut member_sources: Vec<Source> = Vec::with_capacity(kappa);
         let mut member_ids = Vec::with_capacity(kappa);
         let mut total_flux = 0.0f32;
@@ -232,7 +211,7 @@ pub fn generate_n_kappa_sources(
             let mut amplitude = if peak_flux_mode {
                 flux
             } else {
-                flux / area
+                flux * psf_peak_factor
             };
 
             if let Some(max_amp_limit) = max_allowed_amplitude {
@@ -256,8 +235,8 @@ pub fn generate_n_kappa_sources(
                 y: sy,
                 flux,
                 amplitude,
-                sigma,
-                fwhm,
+                sigma: psf.sigma,
+                fwhm: psf.fwhm,
                 kappa_id: k_idx + 1,
                 kappa,
             });
@@ -282,7 +261,7 @@ pub fn generate_n_kappa_sources(
                 max_r_sq = r_sq;
             }
         }
-        let radius = max_r_sq.sqrt() + fwhm / 2.0;
+        let radius = max_r_sq.sqrt() + psf.fwhm / 2.0;
         let snr = total_flux / noise_sigma;
 
         all_sources.extend(member_sources);
@@ -331,7 +310,7 @@ pub fn generate_n_kappa_sources(
 /// Print formatted breakdown summary table of extracted kappa-sources
 #[allow(dead_code)]
 pub fn print_kappa_summary(kappa_sources: &[KappaSource], noise_sigma: f32, detection_sigma: f32) {
-    let mut counts_by_kappa: HashMap<usize, (usize, f32, f32, f32)> = HashMap::new(); // (count, sum_flux, sum_radius, max_snr)
+    let mut counts_by_kappa: HashMap<usize, (usize, f32, f32, f32)> = HashMap::new();
 
     let mut max_k = 0;
     for ks in kappa_sources {

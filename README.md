@@ -85,9 +85,11 @@ cargo run --release --bin kappa_generate -- \
 | `--size` | `-M` | `4096` | Image dimension $M$ for $M \times M$ grid |
 | `--max-kappa` | `-k` | `5` | Maximum multiplicity upper limit ($\kappa \in [1, \kappa_{\max}]$) |
 | `--max-radius` | `-r` | `25.0` | Maximum spatial cluster radius in pixels ($R_{\max}$) |
+| `--psf` | | `gaussian` | PSF convolution model: `gaussian` or `moffat` |
+| `--fwhm` | | `10.0` | PSF Full Width at Half Maximum in pixels |
+| `--moffat-beta` | | `4.765` | Power-law index beta for Moffat atmospheric seeing PSF |
 | `--detection-sigma` | `-s` | `3.0` | Collective detection threshold ($\sum F_i \ge S \times \text{RMS}$) |
 | `--noise-sigma` | | `1.0` | Background Gaussian noise RMS |
-| `--fwhm` | | `10.0` | Gaussian PSF FWHM in pixels |
 | `--output` | `-o` | `mock_kappa_image.fits` | Output FITS file path |
 
 ---

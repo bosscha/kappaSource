@@ -73,7 +73,7 @@
 )[
   #text(weight: "bold", fill: rgb("#1e40af"))[Abstract] \
   #v(0.2em)
-  This document provides the formal theoretical definition and practical operating instructions for the *$kappa$-Source Framework*. Under this formalism, any astronomical image is conceptualized as the union of $kappa$-sources ($kappa in {1, 2, dots, n}$). We define a $kappa$-source as a coherent cluster of $kappa$ constituent point sources within a spatial radius $R <= R_max$ whose individual flux is below standard detection thresholds ($F_i < 3 "RMS"$), but whose collective integrated flux satisfies $sum F_i >= 3 "RMS"$. We present high-performance Rust tools (`kappa_generate.bin` and `kappa_extract.bin`) to synthesize mock FITS images and perform hierarchical extraction from arbitrary FITS files.
+  This document provides the formal theoretical definition and practical operating instructions for the *$kappa$-Source Framework*. Under this formalism, any astronomical image is conceptualized as the union of $kappa$-sources ($kappa in {1, 2, dots, n}$). We define a $kappa$-source as a coherent cluster of $kappa$ constituent point sources within a spatial radius $R <= R_max$ whose individual flux is below standard detection thresholds ($F_i < 3 "RMS"$), but whose collective integrated flux satisfies $sum F_i >= 3 "RMS"$. In mock image synthesis, each point source subcomponent is explicitly convolved with the telescope Point Spread Function (PSF). We present high-performance Rust tools (`kappa_generate.bin` and `kappa_extract.bin`) to synthesize mock FITS images and perform hierarchical extraction from arbitrary FITS files.
 ]
 
 #v(1em)
@@ -83,9 +83,10 @@
 == The Fundamental Image Decomposition Principle
 In conventional astronomical source detection (e.g., standard thresholding), images are decomposed solely into isolated point-like or extended components exceeding a local detection threshold (typically $3 sigma$ or $5 sigma$). Faint sub-threshold components buried in noise are discarded.
 
-Under the *$kappa$-Source Formalism*, an astronomical image $I(x, y)$ is defined as the union of $kappa$-sources:
-$ I(x, y) = cal(N)(0, sigma_text("noise")^2) + union.big_(kappa=1)^n union.big_(j=1)^(N_kappa) S_(kappa, j)(x, y) $
-where $kappa$ designates the *multiplicity* (number of constituent point sources) of the source, and $N_kappa$ is the number of $kappa$-sources of order $kappa$.
+Under the *$kappa$-Source Formalism*, an astronomical sky model $I_text("sky")(x, y)$ consists of constituent subcomponents that are convolved with the instrument Point Spread Function $"PSF"(x, y)$ and perturbed by background noise:
+$ I_text("obs")(x, y) = [ I_text("sky") star "PSF" ](x, y) + cal(N)(0, sigma_text("RMS")^2) $
+where the sky is formed by the union of $kappa$-sources:
+$ I_text("sky")(x, y) = union.big_(kappa=1)^n union.big_(j=1)^(N_kappa) S_(kappa, j)(x, y) $
 
 == Mathematical Definition of a $kappa$-Source
 A $kappa$-Source $C_kappa = {s_1, s_2, dots, s_kappa}$ of multiplicity $kappa$ is formed by $kappa$ point sources satisfying two strict criteria:
@@ -113,6 +114,18 @@ A $kappa$-Source $C_kappa = {s_1, s_2, dots, s_kappa}$ of multiplicity $kappa$ i
   [$kappa = n$ ($n$-source)], [$F_i < 3 sigma_text("RMS")$], [$sum F_i >= 3 sigma_text("RMS")$], [Cluster of $n$ faint subcomponents],
 )
 
+== Point Spread Function (PSF) Convolution
+Each constituent subcomponent $i$ is a point source with flux $F_i$ at position $(x_i, y_i)$:
+$ I_(i, text("sky"))(x, y) = F_i delta(x - x_i, y - y_i) $
+Convolution with the telescope PSF produces the observed 2D intensity profile:
+$ I_(i, text("conv"))(x, y) = [ I_(i, text("sky")) star "PSF" ](x, y) = F_i dot "PSF"(x - x_i, y - y_i) $
+
+Supported PSF models:
+- *2D Gaussian PSF*:
+  $ "PSF"(r) = 1 / (2 pi sigma_text("PSF")^2) exp(- r^2 / (2 sigma_text("PSF")^2) ), quad sigma_text("PSF") = "FWHM" / (2 sqrt(2 ln 2)) $
+- *2D Moffat PSF* (Atmospheric Seeing):
+  $ "PSF"(r) = (beta - 1) / (pi alpha^2) [ 1 + r^2 / alpha^2 ]^(-beta), quad alpha = "FWHM" / (2 sqrt(2^(1/beta) - 1)) $
+
 == Hierarchical Extraction Sequence
 Extraction proceeds *hierarchically in order of increasing multiplicity*:
 1. First, all *1-sources* ($kappa = 1$) are identified and cataloged.
@@ -139,7 +152,7 @@ All data generated and extracted are stored in standard multi-extension astronom
   stroke: 0.5pt + rgb("#cbd5e1"),
   align: (center, center, center, left),
   [HDU], [Name], [Type], [Contents],
-  [0], [`PRIMARY`], [Image HDU], [2D Float array ($M times M$) with metadata (`NKAPPA`, `KAP_MAX`, `KAP_RAD`, `DET_SIG`, `BG_SIGMA`)],
+  [0], [`PRIMARY`], [Image HDU], [2D Float array ($M times M$) with metadata (`CONVOLV`, `PSF_TYPE`, `PSF_FWHM`, `NKAPPA`, `KAP_MAX`, `KAP_RAD`, `DET_SIG`, `BG_SIGMA`)],
   [1], [`SOURCES`], [Binary Table], [Point sources catalog (`ID`, `X`, `Y`, `FLUX`, `AMPLITUDE`, `SIGMA`, `FWHM`, `KAPPA_ID`, `KAPPA`)],
   [2], [`KAPPA_SRCS`], [Binary Table], [Extracted $kappa$-sources catalog (`KAPPA_ID`, `KAPPA`, `CEN_X`, `CEN_Y`, `TOTAL_FLUX`, `RADIUS`, `SNR`, `N_MEMBERS`)],
 )
@@ -148,7 +161,7 @@ All data generated and extracted are stored in standard multi-extension astronom
 
 = Practical Guide: Generating Mock FITS Images
 
-The tool `kappa_generate.bin` synthesizes an $M times M$ mock FITS image containing $N$ $kappa$-sources with multiplicity $kappa <= kappa_max$ and cluster radius $R <= R_max$ on top of Gaussian background noise.
+The tool `kappa_generate.bin` synthesizes an $M times M$ mock FITS image containing $N$ $kappa$-sources with multiplicity $kappa <= kappa_max$ and cluster radius $R <= R_max$ convolved with the telescope PSF on top of Gaussian background noise.
 
 == Command-Line Parameters
 
@@ -162,20 +175,22 @@ The tool `kappa_generate.bin` synthesizes an $M times M$ mock FITS image contain
   [`--size`], [`-M`], [`4096`], [Image grid dimension $M$ ($M times M$ pixels)],
   [`--max-kappa`], [`-k`], [`5`], [Maximum multiplicity bound ($1 <= kappa <= kappa_max$)],
   [`--max-radius`], [`-r`], [`25.0`], [Maximum spatial cluster radius in pixels ($R_max$)],
+  [`--psf`], [], [`gaussian`], [PSF profile model: `gaussian` or `moffat`],
+  [`--fwhm`], [], [`10.0`], [PSF Full Width at Half Maximum in pixels],
+  [`--moffat-beta`], [], [`4.765`], [Power-law index beta for Moffat PSF],
   [`--detection-sigma`], [`-s`], [`3.0`], [Collective flux threshold ($sum F_i >= S times "RMS"$)],
   [`--noise-sigma`], [], [`1.0`], [Background Gaussian noise standard deviation (RMS)],
-  [`--fwhm`], [], [`10.0`], [Gaussian PSF Full Width at Half Maximum in pixels],
   [`--output`], [`-o`], [`mock_kappa_image.fits`], [Output FITS file path],
 )
 
 == Usage Examples
 
 ```bash
-# 1. Generate 50 kappa-sources (kappa <= 5, radius <= 25 px) on a 4096 x 4096 grid:
-./kappa_generate.bin -N 50 -M 4096 -k 5 -r 25.0 -s 3.0 --output mock_kappa.fits
+# 1. Generate 50 kappa-sources convolved by Gaussian PSF on a 4096 x 4096 grid:
+./kappa_generate.bin -N 50 -M 4096 -k 5 -r 25.0 --psf gaussian --fwhm 10.0 --output mock_kappa.fits
 
-# 2. Generate 100 kappa-sources with custom noise RMS = 2.0 and detection = 5xRMS:
-./kappa_generate.bin -N 100 -M 4096 -k 6 -r 30.0 --noise-sigma 2.0 -s 5.0 -o sim.fits
+# 2. Generate with Moffat atmospheric seeing PSF (FWHM = 8 px, beta = 4.765):
+./kappa_generate.bin -N 60 -M 2048 -k 4 -r 20.0 --psf moffat --fwhm 8.0 -s 3.0 -o moffat_sim.fits
 ```
 
 #v(1em)
@@ -183,13 +198,6 @@ The tool `kappa_generate.bin` synthesizes an $M times M$ mock FITS image contain
 = Practical Guide: Extracting $kappa$-Sources from FITS
 
 The tool `kappa_extract.bin` ingests any arbitrary 2D FITS file (real or simulated) and extracts the $kappa$-source hierarchy.
-
-== Extraction Algorithm Pipeline
-1. *Noise Background Ingestion*: Computes image median and Median Absolute Deviation ($sigma = 1.4826 times "MAD"$).
-2. *Gaussian Matched Filtering*: Convolves the 2D image with the PSF kernel to maximize the SNR of point-source features and eliminate single-pixel noise fluctuations.
-3. *Subcomponent Peak Finding*: Detects local intensity peaks with sub-pixel quadratic centroid refinement and aperture flux integration.
-4. *Hierarchical Graph Clustering*: Groups subcomponents within distance $R_max$, validates $sum F_i >= 3 "RMS"$, verifies individual subcomponent limits, and sorts from $kappa=1$ upwards.
-5. *Catalog Export*: Produces `<input>.extracted.fits` and `<input>.extracted.reg` (DS9 region overlay).
 
 == Command-Line Parameters
 
@@ -238,7 +246,6 @@ ds9 test.fits -regions test.extracted.reg -scale zscale -zoom to fit
 == Inspecting Catalogs in Python (Astropy)
 ```python
 from astropy.io import fits
-import numpy as np
 
 with fits.open("test.extracted.fits") as hdul:
     hdul.info()

@@ -509,10 +509,13 @@ fn print_extraction_report(
         }
     }
 
+    let member_subcomponents_count = sources.iter().filter(|s| s.kappa > 0).count();
+
     println!("--------------------------------------------------------------------------------");
     println!("Background Level : Median = {:.4}, Pixel RMS = {:.4}, Beam Flux RMS = {:.4}", 
         bg_median, bg_rms, beam_flux_rms);
-    println!("Candidate Peaks  : {} subcomponents detected", sources.len());
+    println!("Constituents     : {} member peaks assigned to {} kappa-sources ({} candidates screened)", 
+        member_subcomponents_count, kappa_sources.len(), sources.len());
     println!("Search Radius    : R_search <= {:.1} pixels", search_radius);
     println!("Detection Cutoff : Total Flux >= {:.2} * Beam RMS ({:.4})", 
         detection_sigma, detection_sigma * beam_flux_rms);
@@ -595,26 +598,46 @@ fn write_csv_catalog(
     Ok(())
 }
 
-/// Write constituent subcomponents table to ASCII (.subcomponents.cat)
+/// Write constituent subcomponents table to ASCII (.subcomponents.cat), strictly excluding unassociated peaks (kappa == 0)
 fn write_subcomponents_ascii_catalog(
     path: &Path,
     input_filename: &str,
     timestamp: &str,
     sources: &[Source],
 ) -> std::io::Result<()> {
+    let valid_sources: Vec<&Source> = sources.iter().filter(|s| s.kappa > 0).collect();
+
     let mut writer = BufWriter::new(File::create(path)?);
     writeln!(writer, "# ==============================================================================")?;
-    writeln!(writer, "# Constituent Subcomponents Peak Catalog")?;
+    writeln!(writer, "# Constituent Subcomponents Peak Catalog (Members of Extracted kappa-Sources)")?;
     writeln!(writer, "# Input FITS File : {}", input_filename)?;
     writeln!(writer, "# Extraction Date : {}", timestamp)?;
-    writeln!(writer, "# Total Peaks     : {}", sources.len())?;
+    writeln!(writer, "# Total Members   : {}", valid_sources.len())?;
     writeln!(writer, "# ==============================================================================")?;
     writeln!(writer, "#{:<7} {:<10} {:<10} {:<12} {:<12} {:<10} {:<6}",
         "PEAK_ID", "X", "Y", "FLUX", "AMPLITUDE", "KAPPA_ID", "KAPPA")?;
     writeln!(writer, "# ------------------------------------------------------------------------------")?;
 
-    for s in sources {
+    for s in valid_sources {
         writeln!(writer, "{:<8} {:<10.3} {:<10.3} {:<12.4} {:<12.4} {:<10} {:<6}",
+            s.id, s.x, s.y, s.flux, s.amplitude, s.kappa_id, s.kappa)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Write constituent subcomponents table to CSV (.subcomponents.csv), strictly excluding unassociated peaks (kappa == 0)
+fn write_subcomponents_csv_catalog(
+    path: &Path,
+    sources: &[Source],
+) -> std::io::Result<()> {
+    let valid_sources: Vec<&Source> = sources.iter().filter(|s| s.kappa > 0).collect();
+
+    let mut writer = BufWriter::new(File::create(path)?);
+    writeln!(writer, "peak_id,x,y,flux,amplitude,kappa_id,kappa")?;
+
+    for s in valid_sources {
+        writeln!(writer, "{},{:.4},{:.4},{:.6},{:.6},{},{}",
             s.id, s.x, s.y, s.flux, s.amplitude, s.kappa_id, s.kappa)?;
     }
     writer.flush()?;
@@ -703,6 +726,7 @@ fn write_extracted_fits_catalog(
     beam_flux_rms: f32,
     detection_sigma: f32,
 ) -> std::io::Result<()> {
+    let valid_sources: Vec<&Source> = sources.iter().filter(|s| s.kappa > 0).collect();
     let mut writer = BufWriter::new(File::create(path)?);
 
     // Primary Header (Null Image)
@@ -800,8 +824,8 @@ fn write_extracted_fits_catalog(
     table_bytes.resize(t_len + t_pad, 0u8);
     writer.write_all(&table_bytes)?;
 
-    // Extension 2: SOURCES (Constituent subcomponents)
-    let num_srcs = sources.len();
+    // Extension 2: SOURCES (Constituent member subcomponents only, kappa > 0)
+    let num_srcs = valid_sources.len();
     let src_row_size = 4 + 4 + 4 + 4 + 4 + 4 + 4; // 28 bytes
 
     let mut s_cards = Vec::new();
@@ -813,7 +837,7 @@ fn write_extracted_fits_catalog(
     s_cards.push(make_fits_card("PCOUNT", "0", Some("size of special data area")));
     s_cards.push(make_fits_card("GCOUNT", "1", Some("one data group")));
     s_cards.push(make_fits_card("TFIELDS", "7", Some("number of fields per row")));
-    s_cards.push(make_fits_card("EXTNAME", &fits_str_val("SOURCES"), Some("Constituent subcomponent peaks")));
+    s_cards.push(make_fits_card("EXTNAME", &fits_str_val("SOURCES"), Some("Member subcomponent peaks")));
 
     s_cards.push(make_fits_card("TTYPE1", &fits_str_val("ID"), Some("Peak subcomponent ID")));
     s_cards.push(make_fits_card("TFORM1", &fits_str_val("1J"), Some("32-bit integer")));
@@ -832,7 +856,7 @@ fn write_extracted_fits_catalog(
     s_cards.push(make_fits_card("TTYPE5", &fits_str_val("AMPLITUDE"), Some("Peak amplitude")));
     s_cards.push(make_fits_card("TFORM5", &fits_str_val("1E"), Some("32-bit float")));
 
-    s_cards.push(make_fits_card("TTYPE6", &fits_str_val("KAPPA_ID"), Some("Parent kappa-source ID (0 if none)")));
+    s_cards.push(make_fits_card("TTYPE6", &fits_str_val("KAPPA_ID"), Some("Parent kappa-source ID")));
     s_cards.push(make_fits_card("TFORM6", &fits_str_val("1J"), Some("32-bit integer")));
 
     s_cards.push(make_fits_card("TTYPE7", &fits_str_val("KAPPA"), Some("Parent kappa multiplicity")));
@@ -850,7 +874,7 @@ fn write_extracted_fits_catalog(
     writer.write_all(&s_bytes)?;
 
     let mut s_table_bytes = Vec::with_capacity(num_srcs * src_row_size + 2880);
-    for s in sources {
+    for s in valid_sources {
         s_table_bytes.extend_from_slice(&(s.id as i32).to_be_bytes());
         s_table_bytes.extend_from_slice(&s.x.to_be_bytes());
         s_table_bytes.extend_from_slice(&s.y.to_be_bytes());
@@ -964,6 +988,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cat_path = parent_dir.join(format!("{}_{}.extracted.cat", input_stem, timestamp));
         let csv_path = parent_dir.join(format!("{}_{}.extracted.csv", input_stem, timestamp));
         let sub_cat_path = parent_dir.join(format!("{}_{}.extracted.subcomponents.cat", input_stem, timestamp));
+        let sub_csv_path = parent_dir.join(format!("{}_{}.extracted.subcomponents.csv", input_stem, timestamp));
 
         println!("Writing ASCII kappa-sources catalog to {}...", cat_path.display());
         write_ascii_catalog(&cat_path, input_filename, &timestamp, &kappa_sources, bg_median, bg_rms, beam_flux_rms, args.detection_sigma)?;
@@ -973,6 +998,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("Writing constituent subcomponents catalog to {}...", sub_cat_path.display());
         write_subcomponents_ascii_catalog(&sub_cat_path, input_filename, &timestamp, &sources)?;
+
+        println!("Writing constituent subcomponents CSV to {}...", sub_csv_path.display());
+        write_subcomponents_csv_catalog(&sub_csv_path, &sources)?;
     }
 
     // 7. Save DS9 region overlays

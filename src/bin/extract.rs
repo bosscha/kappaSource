@@ -27,7 +27,7 @@ pub struct ExtractCli {
     #[arg(short = 'k', long, default_value_t = 0)]
     pub max_kappa: usize,
 
-    /// Detection threshold for total collective flux in units of image RMS (e.g. 3.0 for 3xRMS)
+    /// Detection threshold for total collective flux in units of beam flux RMS (e.g. 3.0 for 3xRMS)
     #[arg(short = 's', long, default_value_t = 3.0)]
     pub detection_sigma: f32,
 
@@ -39,11 +39,11 @@ pub struct ExtractCli {
     #[arg(long, default_value_t = 10.0)]
     pub fwhm: f32,
 
-    /// Peak detection threshold in SNR units (in matched-filtered map) to identify subcomponents
-    #[arg(long, default_value_t = 2.5)]
+    /// Peak detection threshold in SNR units (in matched-filtered map) to identify candidate subcomponents
+    #[arg(long, default_value_t = 2.0)]
     pub peak_snr: f32,
 
-    /// Maximum individual flux for a single subcomponent in kappa >= 2 (in units of RMS)
+    /// Maximum individual flux for a single subcomponent in kappa >= 2 (in units of beam RMS)
     #[arg(long, default_value_t = 3.0)]
     pub subcomponent_max_sigma: f32,
 
@@ -79,7 +79,7 @@ fn gaussian_filter_2d(
     height: usize,
     sigma: f32,
     bg_median: f32,
-) -> Vec<f32> {
+) -> (Vec<f32>, f32) {
     let radius = (3.0 * sigma).ceil() as isize;
     let mut kernel = Vec::new();
     let two_sigma_sq = 2.0 * sigma * sigma;
@@ -91,6 +91,10 @@ fn gaussian_filter_2d(
     for k in &mut kernel {
         *k /= k_sum;
     }
+
+    // Kernel sum of squares for 2D kernel
+    let k_sum_sq_1d: f32 = kernel.iter().map(|&v| v * v).sum();
+    let k_sum_sq_2d = k_sum_sq_1d * k_sum_sq_1d;
 
     // Horizontal pass
     let mut temp = vec![0.0f32; width * height];
@@ -122,10 +126,10 @@ fn gaussian_filter_2d(
         }
     }
 
-    filtered
+    (filtered, k_sum_sq_2d)
 }
 
-/// Detects local peak subcomponents in the 2D filtered image
+/// Detects local peak subcomponents in the 2D filtered image with optimal matched filter photometry
 fn detect_subcomponents(
     raw_data: &[f32],
     width: usize,
@@ -133,16 +137,18 @@ fn detect_subcomponents(
     bg_median: f32,
     fwhm: f32,
     peak_snr: f32,
-) -> Vec<Source> {
+) -> (Vec<Source>, f32, f32) {
     let sigma_psf = fwhm / (2.0 * (2.0 * 2.0f32.ln()).sqrt());
 
-    let filtered = gaussian_filter_2d(raw_data, width, height, sigma_psf, bg_median);
+    let (filtered, k_sum_sq_2d) = gaussian_filter_2d(raw_data, width, height, sigma_psf, bg_median);
     let (_, filtered_rms) = estimate_background_and_rms(&filtered);
+
+    // Beam flux RMS: noise standard deviation on the integrated flux
+    let flux_conv_factor = 1.0 / k_sum_sq_2d;
+    let beam_flux_rms = filtered_rms * flux_conv_factor;
 
     let min_filtered_peak = peak_snr * filtered_rms;
     let min_peak_sep = (fwhm * 0.4).ceil().max(2.0) as isize;
-    let aper_radius = (fwhm * 0.8).max(3.0);
-    let aper_radius_sq = aper_radius * aper_radius;
 
     let mut peak_locs = Vec::new();
 
@@ -180,56 +186,38 @@ fn detect_subcomponents(
     let mut sources = Vec::with_capacity(peak_locs.len());
     let mut sid = 1;
 
-    for (px, py, _) in peak_locs {
-        let mut sum_w = 0.0f32;
-        let mut sum_wx = 0.0f32;
-        let mut sum_wy = 0.0f32;
-        let mut aper_flux = 0.0f32;
-        let mut peak_val = 0.0f32;
+    for (px, py, peak_val) in peak_locs {
+        // 3x3 Sub-pixel parabolic centroid refinement
+        let v_c = peak_val;
+        let v_l = filtered[py * width + (px - 1)];
+        let v_r = filtered[py * width + (px + 1)];
+        let v_u = filtered[(py - 1) * width + px];
+        let v_d = filtered[(py + 1) * width + px];
 
-        let r_box = aper_radius.ceil() as isize;
-        for dy in -r_box..=r_box {
-            let ny = py as isize + dy;
-            if ny < 0 || ny >= height as isize {
-                continue;
-            }
-            for dx in -r_box..=r_box {
-                let nx = px as isize + dx;
-                if nx < 0 || nx >= width as isize {
-                    continue;
-                }
-
-                let d_sq = (dx * dx + dy * dy) as f32;
-                if d_sq <= aper_radius_sq {
-                    let pixel_val = (raw_data[ny as usize * width + nx as usize] - bg_median).max(0.0);
-                    aper_flux += pixel_val;
-                    if pixel_val > peak_val {
-                        peak_val = pixel_val;
-                    }
-
-                    let w = pixel_val * pixel_val;
-                    sum_w += w;
-                    sum_wx += w * nx as f32;
-                    sum_wy += w * ny as f32;
-                }
-            }
-        }
-
-        let aper_correction = 1.0 / (1.0 - (-aper_radius_sq / (2.0 * sigma_psf * sigma_psf)).exp());
-        let estimated_total_flux = aper_flux * aper_correction;
-
-        let (sub_x, sub_y) = if sum_w > 0.0 {
-            (sum_wx / sum_w, sum_wy / sum_w)
+        let dx = if (2.0 * v_c - v_l - v_r).abs() > 1e-5 {
+            0.5 * (v_l - v_r) / (v_l - 2.0 * v_c + v_r)
         } else {
-            (px as f32, py as f32)
+            0.0
         };
+        let dy = if (2.0 * v_c - v_u - v_d).abs() > 1e-5 {
+            0.5 * (v_u - v_d) / (v_u - 2.0 * v_c + v_d)
+        } else {
+            0.0
+        };
+
+        let sub_x = (px as f32 + dx.clamp(-0.8, 0.8)).clamp(0.0, width as f32 - 1.0);
+        let sub_y = (py as f32 + dy.clamp(-0.8, 0.8)).clamp(0.0, height as f32 - 1.0);
+
+        // Optimal unbiased flux estimate from matched filter peak
+        let estimated_total_flux = peak_val * flux_conv_factor;
+        let peak_amplitude = estimated_total_flux / (2.0 * std::f32::consts::PI * sigma_psf * sigma_psf);
 
         sources.push(Source {
             id: sid,
             x: sub_x,
             y: sub_y,
             flux: estimated_total_flux,
-            amplitude: peak_val,
+            amplitude: peak_amplitude,
             sigma: sigma_psf,
             fwhm,
             kappa_id: 0,
@@ -238,7 +226,7 @@ fn detect_subcomponents(
         sid += 1;
     }
 
-    sources
+    (sources, filtered_rms, beam_flux_rms)
 }
 
 /// Extract kappa-sources hierarchically with max_kappa and radius constraints
@@ -248,15 +236,15 @@ fn extract_kappa_hierarchy(
     max_kappa: usize,
     detection_sigma: f32,
     sub_max_sigma: f32,
-    bg_rms: f32,
+    beam_flux_rms: f32,
 ) -> Vec<KappaSource> {
     let n = sources.len();
     if n == 0 {
         return Vec::new();
     }
 
-    let min_detection_flux = detection_sigma * bg_rms;
-    let max_sub_flux = sub_max_sigma * bg_rms;
+    let min_detection_flux = detection_sigma * beam_flux_rms;
+    let max_sub_flux = sub_max_sigma * beam_flux_rms;
     let dist_sq_thresh = (max_radius * 1.5) * (max_radius * 1.5);
 
     // Proximity graph
@@ -347,7 +335,7 @@ fn extract_kappa_hierarchy(
         let radius = max_r_sq.sqrt() + fwhm / 2.0;
 
         if total_flux >= min_detection_flux && (kappa == 1 || (radius <= max_radius * 1.5 && all_sub_subthreshold)) {
-            let snr = total_flux / bg_rms;
+            let snr = total_flux / beam_flux_rms;
 
             kappa_sources.push(KappaSource {
                 id: 0,
@@ -396,6 +384,7 @@ fn print_extraction_report(
     sources: &[Source],
     bg_median: f32,
     bg_rms: f32,
+    beam_flux_rms: f32,
     detection_sigma: f32,
     max_kappa: usize,
 ) {
@@ -416,9 +405,11 @@ fn print_extraction_report(
     }
 
     println!("--------------------------------------------------------------------------------");
-    println!("Background Level : Median = {:.4}, RMS (Noise) = {:.4}", bg_median, bg_rms);
+    println!("Background Level : Median = {:.4}, Pixel RMS = {:.4}, Beam Flux RMS = {:.4}", 
+        bg_median, bg_rms, beam_flux_rms);
     println!("Candidate Peaks  : {} subcomponents detected", sources.len());
-    println!("Detection Cutoff : Total Flux >= {:.2} * RMS ({:.4})", detection_sigma, detection_sigma * bg_rms);
+    println!("Detection Cutoff : Total Flux >= {:.2} * Beam RMS ({:.4})", 
+        detection_sigma, detection_sigma * beam_flux_rms);
     if max_kappa > 0 {
         println!("Multiplicity Cut : kappa <= {}", max_kappa);
     }
@@ -525,6 +516,7 @@ fn write_extracted_fits_catalog(
     _sources: &[Source],
     bg_median: f32,
     bg_rms: f32,
+    beam_flux_rms: f32,
     detection_sigma: f32,
 ) -> std::io::Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
@@ -536,7 +528,8 @@ fn write_extracted_fits_catalog(
     p_cards.push(make_fits_card("NAXIS", "0", Some("No image data in primary HDU")));
     p_cards.push(make_fits_card("EXTEND", "T", Some("Extensions present")));
     p_cards.push(make_fits_card("BG_MED", &format!("{:.6}", bg_median), Some("Background median")));
-    p_cards.push(make_fits_card("BG_RMS", &format!("{:.6}", bg_rms), Some("Background RMS")));
+    p_cards.push(make_fits_card("BG_RMS", &format!("{:.6}", bg_rms), Some("Background pixel RMS")));
+    p_cards.push(make_fits_card("FLUX_RMS", &format!("{:.6}", beam_flux_rms), Some("Beam flux RMS")));
     p_cards.push(make_fits_card("DET_SIG", &format!("{:.2}", detection_sigma), Some("Detection sigma")));
     p_cards.push(make_fits_card("NKAPPA", &kappa_sources.len().to_string(), Some("Total extracted kappa-sources")));
     p_cards.push(make_fits_card("END", "", None));
@@ -589,7 +582,7 @@ fn write_extracted_fits_catalog(
     ext_cards.push(make_fits_card("TFORM7", &fits_str_val("1E"), Some("32-bit float")));
     ext_cards.push(make_fits_card("TUNIT7", &fits_str_val("pixel"), None));
 
-    ext_cards.push(make_fits_card("TTYPE8", &fits_str_val("SNR"), Some("Total flux / RMS")));
+    ext_cards.push(make_fits_card("TTYPE8", &fits_str_val("SNR"), Some("Total flux / Beam RMS")));
     ext_cards.push(make_fits_card("TFORM8", &fits_str_val("1E"), Some("32-bit float")));
 
     ext_cards.push(make_fits_card("TTYPE9", &fits_str_val("N_MEMBERS"), Some("Number of member subcomponents")));
@@ -634,14 +627,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("kappa-Source Extractor from FITS Image (kappa_extract.bin)");
     println!("==============================================================================");
     println!("Input FITS File      : {}", args.input.display());
-    println!("Detection Threshold  : Total Flux >= {:.2} * RMS", args.detection_sigma);
+    println!("Detection Threshold  : Total Flux >= {:.2} * Beam RMS", args.detection_sigma);
     println!("Clustering Radius    : <= {:.1} pixels", args.cluster_radius);
     if args.max_kappa > 0 {
         println!("Max Multiplicity     : kappa <= {}", args.max_kappa);
     } else {
         println!("Max Multiplicity     : Unlimited");
     }
-    println!("Subcomponent Limit   : Flux < {:.2} * RMS for kappa >= 2", args.subcomponent_max_sigma);
+    println!("Subcomponent Limit   : Flux < {:.2} * Beam RMS for kappa >= 2", args.subcomponent_max_sigma);
     println!("Estimated PSF FWHM   : {:.1} pixels", args.fwhm);
     println!("==============================================================================");
 
@@ -654,9 +647,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Estimating background and RMS noise level...");
     let (bg_median, bg_rms) = estimate_background_and_rms(&fits_img.data);
 
-    // 3. Detect candidate subcomponents (local peaks)
+    // 3. Detect candidate subcomponents (local peaks) with optimal matched filter photometry
     println!("Detecting candidate point-source subcomponents with matched filtering...");
-    let mut sources = detect_subcomponents(
+    let (mut sources, _filtered_rms, beam_flux_rms) = detect_subcomponents(
         &fits_img.data,
         fits_img.width,
         fits_img.height,
@@ -673,7 +666,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.max_kappa,
         args.detection_sigma,
         args.subcomponent_max_sigma,
-        bg_rms,
+        beam_flux_rms,
     );
 
     // 5. Display extraction summary report
@@ -682,6 +675,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &sources,
         bg_median,
         bg_rms,
+        beam_flux_rms,
         args.detection_sigma,
         args.max_kappa,
     );
@@ -693,7 +687,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         p
     });
     println!("Writing extracted catalog to {}...", out_fits_path.display());
-    write_extracted_fits_catalog(&out_fits_path, &kappa_sources, &sources, bg_median, bg_rms, args.detection_sigma)?;
+    write_extracted_fits_catalog(&out_fits_path, &kappa_sources, &sources, bg_median, bg_rms, beam_flux_rms, args.detection_sigma)?;
 
     // 7. Save DS9 region overlay
     if args.save_regions {

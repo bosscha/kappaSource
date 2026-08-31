@@ -52,7 +52,7 @@ pub struct KappaSource {
     pub max_amplitude: f32,
     /// Spatial extent / characteristic bounding radius in pixels
     pub radius: f32,
-    /// Signal-to-noise ratio: total_flux / noise_sigma
+    /// Signal-to-noise ratio: total_flux / flux_rms
     pub snr: f32,
 }
 
@@ -61,9 +61,9 @@ pub struct KappaSource {
 /// Physical constraints:
 /// - kappa multiplicity in [1, max_kappa]
 /// - All constituent point sources within max_radius from centroid
-/// - Total collective flux >= detection_sigma * noise_sigma (default: 3.0 * RMS)
-/// - For kappa >= 2: Every individual subcomponent flux < subcomponent_max_sigma * noise_sigma
-/// - For kappa = 1: Single source flux >= detection_sigma * noise_sigma
+/// - Total collective flux >= detection_sigma * flux_rms (default: 3.0 * RMS)
+/// - For kappa >= 2: Every individual subcomponent flux < subcomponent_max_sigma * flux_rms
+/// - For kappa = 1: Single source flux >= detection_sigma * flux_rms
 /// - Each subcomponent is convolved by the telescope PSF
 #[allow(dead_code)]
 pub fn generate_n_kappa_sources(
@@ -81,8 +81,17 @@ pub fn generate_n_kappa_sources(
     noise_sigma: f32,
     rng: &mut StdRng,
 ) -> (Vec<Source>, Vec<KappaSource>) {
-    let min_detection_flux = detection_sigma * noise_sigma;
-    let sub_max_flux_limit = subcomponent_max_sigma * noise_sigma;
+    let beam_flux_rms = noise_sigma * (4.0 * std::f32::consts::PI * psf.sigma * psf.sigma).sqrt();
+    let min_detection_flux = if peak_flux_mode {
+        detection_sigma * noise_sigma
+    } else {
+        detection_sigma * beam_flux_rms
+    };
+    let sub_max_flux_limit = if peak_flux_mode {
+        subcomponent_max_sigma * noise_sigma
+    } else {
+        subcomponent_max_sigma * beam_flux_rms
+    };
 
     let psf_peak_factor = psf.peak_response();
 
@@ -141,7 +150,7 @@ pub fn generate_n_kappa_sources(
         }
         placed_centers.push((center_x, center_y));
 
-        // Determine total target flux for this kappa-source (>= detection_sigma * noise_sigma)
+        // Determine total target flux for this kappa-source (>= detection_sigma * beam_flux_rms)
         let total_target_flux = min_detection_flux * (1.0 + rng.gen_range(0.05..0.5));
 
         // Generate constituent fluxes
@@ -262,7 +271,7 @@ pub fn generate_n_kappa_sources(
             }
         }
         let radius = max_r_sq.sqrt() + psf.fwhm / 2.0;
-        let snr = total_flux / noise_sigma;
+        let snr = total_flux / beam_flux_rms;
 
         all_sources.extend(member_sources);
 
@@ -348,7 +357,7 @@ pub fn print_kappa_summary(kappa_sources: &[KappaSource], noise_sigma: f32, dete
         }
     }
     println!("--------------------------------------------------------------------------------");
-    println!("Total kappa-Sources: {} (Detection Condition: Total Flux >= {:.2} * RMS ({:.4}))", 
-        kappa_sources.len(), detection_sigma, detection_sigma * noise_sigma);
+    println!("Total kappa-Sources: {} (Detection Condition: Total Flux >= {:.2} * RMS (Noise σ={:.4}))", 
+        kappa_sources.len(), detection_sigma, noise_sigma);
     println!("--------------------------------------------------------------------------------");
 }

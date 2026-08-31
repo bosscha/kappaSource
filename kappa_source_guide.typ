@@ -284,7 +284,8 @@ To prevent accidental overwrites and keep session records organized, `kappa_extr
   [`--max-kappa`], [`-k`], [`0` *(all)*], [Maximum multiplicity upper limit (e.g. `-k 3` restricts to $kappa <= 3$)],
   [`--detection-sigma`], [`-s`], [`3.0`], [Collective flux detection threshold ($>= S times "Beam RMS"$)],
   [`--search-radius`], [`-r`], [`25.0`], [Search radius $R_text("search")$ in pixels from centroid],
-  [`--fwhm`], [], [`10.0`], [Estimated PSF FWHM in pixels],
+  [`--fwhm`], [], [`10.0`], [Estimated PSF FWHM in pixels (set 0 or use `--psf-auto` for auto mode)],
+  [`--psf-auto`], [], [`false`], [Automatically measure PSF FWHM from bright isolated point sources],
   [`--min-sub-snr`], [], [`1.2`], [Minimum candidate peak SNR for subcomponents in matched filter],
   [`--seed-snr`], [], [`2.2`], [Candidate cluster seed threshold on smoothed map (alias: `--peak-snr`)],
   [`--output`], [`-o`], [`<auto>`], [Custom output FITS catalog path (defaults to timestamped name)],
@@ -293,11 +294,11 @@ To prevent accidental overwrites and keep session records organized, `kappa_extr
 == Usage Examples
 
 ```bash
-# 1. Standard extraction generating timestamped FITS, ASCII .cat, CSV, and .reg files:
-./kappa_extract.bin test.fits -s 3.0 -r 25.0
+# 1. Automatic extraction measuring PSF FWHM directly from the image:
+./kappa_extract.bin test.fits --psf-auto -s 3.0 -r 25.0
 
-# 2. Extract only up to 3-sources (kappa <= 3) with 5xRMS detection threshold:
-./kappa_extract.bin test.fits -k 3 -s 5.0 -r 30.0 -o catalog.fits
+# 2. Extract with known FWHM and 5xRMS detection threshold:
+./kappa_extract.bin test.fits --fwhm 10.0 -s 5.0 -r 30.0
 ```
 
 #v(1em)

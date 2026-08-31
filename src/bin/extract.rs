@@ -36,9 +36,13 @@ pub struct ExtractCli {
     #[arg(short = 'r', long = "search-radius", alias = "cluster-radius", default_value_t = 25.0)]
     pub search_radius: f32,
 
-    /// Estimated PSF FWHM in pixels
+    /// Estimated PSF FWHM in pixels (set 0 or use --psf-auto for automatic empirical measurement)
     #[arg(long, default_value_t = 10.0)]
     pub fwhm: f32,
+
+    /// Automatically estimate the PSF FWHM from bright isolated point sources in the image
+    #[arg(long = "psf-auto", alias = "auto-psf", default_value_t = false)]
+    pub psf_auto: bool,
 
     /// Minimum SNR for individual candidate subcomponent peaks inside a search radius
     #[arg(long, default_value_t = 1.2)]
@@ -116,6 +120,129 @@ fn estimate_background_and_rms(data: &[f32]) -> (f32, f32) {
 
     let rms = (1.4826 * mad).max(1e-6);
     (median, rms)
+}
+
+/// Automatically estimate PSF FWHM by fitting 2D intensity moments to bright isolated point sources
+fn estimate_psf_fwhm_auto(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    bg_median: f32,
+    bg_rms: f32,
+) -> Option<(f32, usize)> {
+    let min_peak_val = bg_median + 2.5 * bg_rms;
+    let stamp_radius: isize = 8;
+    let min_sep: isize = 12;
+
+    // 1. Gather all prominent local maxima
+    let mut candidate_peaks = Vec::new();
+    for y in (min_sep as usize)..(height - min_sep as usize) {
+        let row_offset = y * width;
+        for x in (min_sep as usize)..(width - min_sep as usize) {
+            let val = data[row_offset + x];
+            if val < min_peak_val {
+                continue;
+            }
+
+            let mut is_max = true;
+            for dy in -min_sep..=min_sep {
+                for dx in -min_sep..=min_sep {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let ny = (y as isize + dy) as usize;
+                    let nx = (x as isize + dx) as usize;
+                    if data[ny * width + nx] > val {
+                        is_max = false;
+                        break;
+                    }
+                }
+                if !is_max {
+                    break;
+                }
+            }
+
+            if is_max {
+                candidate_peaks.push((x, y, val - bg_median));
+            }
+        }
+    }
+
+    if candidate_peaks.is_empty() {
+        return None;
+    }
+
+    // 2. Sort by peak intensity descending (brightest stars first)
+    candidate_peaks.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    let top_sample_count = candidate_peaks.len().min(100);
+
+    let mut fwhm_samples = Vec::new();
+
+    for &(x, y, _) in &candidate_peaks[..top_sample_count] {
+        let mut sum_i = 0.0f32;
+        let mut sum_ix = 0.0f32;
+        let mut sum_iy = 0.0f32;
+
+        for dy in -stamp_radius..=stamp_radius {
+            for dx in -stamp_radius..=stamp_radius {
+                let ny = (y as isize + dy) as usize;
+                let nx = (x as isize + dx) as usize;
+                let i_val = (data[ny * width + nx] - bg_median).max(0.0);
+                sum_i += i_val;
+                sum_ix += i_val * dx as f32;
+                sum_iy += i_val * dy as f32;
+            }
+        }
+
+        if sum_i <= 0.0 {
+            continue;
+        }
+
+        let cx = sum_ix / sum_i;
+        let cy = sum_iy / sum_i;
+
+        let mut mxx = 0.0f32;
+        let mut myy = 0.0f32;
+        let mut mxy = 0.0f32;
+
+        for dy in -stamp_radius..=stamp_radius {
+            for dx in -stamp_radius..=stamp_radius {
+                let ny = (y as isize + dy) as usize;
+                let nx = (x as isize + dx) as usize;
+                let i_val = (data[ny * width + nx] - bg_median).max(0.0);
+                let diff_x = dx as f32 - cx;
+                let diff_y = dy as f32 - cy;
+                mxx += i_val * diff_x * diff_x;
+                myy += i_val * diff_y * diff_y;
+                mxy += i_val * diff_x * diff_y;
+            }
+        }
+
+        mxx /= sum_i;
+        myy /= sum_i;
+        mxy /= sum_i;
+
+        let det = mxx * myy - mxy * mxy;
+        if det <= 0.0 {
+            continue;
+        }
+
+        let sigma = det.powf(0.25);
+        let fwhm = 2.35482 * sigma;
+        let ellipticity = (mxx - myy).abs() / (mxx + myy + 1e-6);
+
+        if fwhm >= 3.0 && fwhm <= 30.0 && ellipticity <= 0.35 {
+            fwhm_samples.push(fwhm);
+        }
+    }
+
+    if fwhm_samples.is_empty() {
+        None
+    } else {
+        fwhm_samples.sort_by(|a, b| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_fwhm = fwhm_samples[fwhm_samples.len() / 2];
+        Some((median_fwhm, fwhm_samples.len()))
+    }
 }
 
 /// Apply fast separable 2D Gaussian filter
@@ -914,6 +1041,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let parent_dir = args.input.parent().unwrap_or_else(|| Path::new("."));
 
+    // 1. Read input FITS image
+    println!("Reading FITS image from {}...", args.input.display());
+    let fits_img = read_fits_image(&args.input)?;
+    println!("Loaded image grid: {} x {} pixels", fits_img.width, fits_img.height);
+
+    // 2. Measure background & noise RMS
+    println!("Estimating background and RMS noise level...");
+    let (bg_median, bg_rms) = estimate_background_and_rms(&fits_img.data);
+
+    // 2b. Automatically estimate PSF FWHM if requested or fwhm <= 0
+    let effective_fwhm = if args.psf_auto || args.fwhm <= 0.0 {
+        println!("Estimating PSF FWHM automatically from bright isolated point sources (--psf-auto)...");
+        match estimate_psf_fwhm_auto(&fits_img.data, fits_img.width, fits_img.height, bg_median, bg_rms) {
+            Some((measured_fwhm, count)) => {
+                println!("Auto-PSF: Measured median FWHM = {:.2} pixels from {} bright point sources.", measured_fwhm, count);
+                measured_fwhm
+            }
+            None => {
+                let fallback = if args.fwhm > 0.0 { args.fwhm } else { 10.0 };
+                println!("Auto-PSF: No bright isolated stars found for calibration. Falling back to default FWHM = {:.1} px.", fallback);
+                fallback
+            }
+        }
+    } else {
+        args.fwhm
+    };
+
     println!("==============================================================================");
     println!("kappa-Source Two-Pass Hierarchical Extractor (kappa_extract.bin)");
     println!("==============================================================================");
@@ -929,17 +1083,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Max Multiplicity     : Unlimited");
     }
     println!("Subcomponent Limit   : Flux < {:.2} * Beam RMS for kappa >= 2", args.subcomponent_max_sigma);
-    println!("Estimated PSF FWHM   : {:.1} pixels", args.fwhm);
+    println!("Operating PSF FWHM   : {:.2} pixels {}", effective_fwhm, if args.psf_auto { "(Auto-Calibrated)" } else { "" });
     println!("==============================================================================");
-
-    // 1. Read input FITS image
-    println!("Reading FITS image from {}...", args.input.display());
-    let fits_img = read_fits_image(&args.input)?;
-    println!("Loaded image grid: {} x {} pixels", fits_img.width, fits_img.height);
-
-    // 2. Measure background & noise RMS
-    println!("Estimating background and RMS noise level...");
-    let (bg_median, bg_rms) = estimate_background_and_rms(&fits_img.data);
 
     // 3. Extract kappa-sources with two-pass hierarchical engine
     println!("Running Two-Pass Hierarchical Extraction (1-sources first, then multi-sources)...");
@@ -949,7 +1094,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fits_img.height,
         bg_median,
         bg_rms,
-        args.fwhm,
+        effective_fwhm,
         args.search_radius,
         args.min_sub_snr,
         args.seed_snr,

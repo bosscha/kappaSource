@@ -43,8 +43,8 @@ pub struct ExtractCli {
     #[arg(long, default_value_t = 1.5)]
     pub min_sub_snr: f32,
 
-    /// Candidate seed detection threshold in SNR units
-    #[arg(long, default_value_t = 2.5)]
+    /// Candidate seed detection threshold in SNR units (alias: --peak-snr)
+    #[arg(long = "seed-snr", alias = "peak-snr", default_value_t = 2.5)]
     pub seed_snr: f32,
 
     /// Maximum individual flux for a single subcomponent in kappa >= 2 (in units of beam RMS)

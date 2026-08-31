@@ -96,7 +96,59 @@ cargo run --release --bin kappa_generate -- \
 
 ### 2. Extracting $\kappa$-Sources from a FITS Image (`kappa_extract`)
 
-Ingest any 2D astronomical FITS file and extract the $\kappa$-source hierarchy:
+#### Extraction Strategy Pipeline
+
+Extracting $\kappa$-sources requires capturing faint sub-threshold peaks without triggering noise percolation, and testing whether spatial clusters reach collective statistical detection ($\ge 3\times\text{RMS}$). The pipeline consists of 5 stages:
+
+1. **Background & Noise Characterization**: Computes median $\mu$ and robust dispersion $\sigma_{\text{RMS}} = 1.4826 \times \text{MAD}(I - \mu)$.
+2. **PSF Matched Filtering**: Convolves with the PSF ($I_{\text{filt}} = (I - \mu) \star \text{PSF}$) to enhance point-source peaks by $\sim \sqrt{2\pi\sigma_{\text{PSF}}^2}$ and suppress noise spikes.
+3. **Subcomponent Photometry**: Local peak finding down to $\text{SNR} \ge 2.5$, sub-pixel intensity centroiding, and circular aperture photometry with analytic PSF loss correction.
+4. **Proximity Graph Clustering**: Graph connected-component clustering with spatial extent $R_{\text{cluster}} \le R_{\max}$.
+5. **Physical Validation**:
+   - **For $\kappa = 1$**: Single point source $\text{Flux} \ge 3.0\times\text{RMS}$.
+   - **For $\kappa \ge 2$**: Every subcomponent $\text{Flux}_i < 3.0\times\text{RMS}$ AND collective integrated sum $\sum \text{Flux}_i \ge 3.0\times\text{RMS}$.
+   - Output catalog sorted hierarchically ($1$-sources $\to 2$-sources $\to 3$-sources $\dots$).
+
+```text
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           Raw 2D FITS Image                             │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 1. Background Estimation: Median μ  &  Noise σ_RMS = 1.4826 × MAD       │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 2. PSF Matched Filter: I_filt = [ (I - μ) ★ PSF ]  (Optimal SNR Boost)  │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 3. Subcomponent Photometry: Peak Finding + Sub-Pixel Centroid + Flux F_i│
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 4. Proximity Graph Clustering: Connected Components with R ≤ R_max      │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 5. Physical Validation:                                                 │
+│    • For κ = 1: Flux ≥ 3×RMS (Point Source Detection)                   │
+│    • For κ ≥ 2: (Each F_i < 3×RMS) AND (∑ F_i ≥ 3×RMS) (Coherent Sum)   │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 6. Hierarchical Catalog Output: 1-src → 2-src → 3-src → ... → n-src     │
+│    Multi-Extension FITS Table (.extracted.fits) + DS9 Overlay (.reg)    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Usage Examples
 
 ```bash
 # Extract kappa-sources with 3xRMS detection threshold and max radius 25 px:

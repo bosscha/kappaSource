@@ -199,6 +199,70 @@ The tool `kappa_generate.bin` synthesizes an $M times M$ mock FITS image contain
 
 The tool `kappa_extract.bin` ingests any arbitrary 2D FITS file (real or simulated) and extracts the $kappa$-source hierarchy.
 
+== Five-Stage Extraction Strategy & Algorithm Pipeline
+
+Extracting $kappa$-sources from a noisy astronomical raster requires solving a dual problem: capturing faint sub-threshold peaks without triggering noise percolation, and testing whether spatial clusters reach statistical detection ($>= 3 "RMS"$). The complete strategy comprises five sequential stages:
+
++ *Noise Background Characterization ($sigma_text("RMS")$)*:
+  Computes background median $mu$ and robust dispersion via the Median Absolute Deviation:
+  $ sigma_text("RMS") = 1.4826 times "median"(|I(x, y) - mu|) $
+
++ *PSF Matched Filtering (Spatial Optimal Filtering)*:
+  Convolves the background-subtracted raster with the PSF kernel $I_text("filt") = (I - mu) star "PSF"$. By the Matched Filter Theorem, this enhances real point-source peaks by a factor of $approx sqrt(2 pi sigma_text("PSF")^2) approx 10 times$ while suppressing single-pixel high-frequency noise spikes.
+
++ *Subcomponent Peak Finding & Aperture Photometry*:
+  Detects local maxima in the matched-filter map down to low candidate SNR ($>= 2.5$). Sub-pixel centroids $(x_i, y_i)$ are refined via 2D intensity moments, and total flux $F_i$ is integrated using circular aperture photometry with analytic PSF aperture loss correction.
+
++ *Proximity Graph Clustering*:
+  Constructs an adjacency graph where vertices are candidate peaks and edges connect neighbors with Euclidean separation $d(s_i, s_j) < 1.5 R_max$. Connected components of size $kappa$ are extracted, and their cluster radius $R_text("cluster") <= R_max$ from the centroid is verified.
+
++ *Physical Validation & Hierarchical Sorting*:
+  Tests each cluster against physical significance criteria:
+  - *For $kappa = 1$*: $F_1 >= S_text("det") times sigma_text("RMS")$
+  - *For $kappa >= 2$*: $(forall i, F_i < S_text("det") times sigma_text("RMS")) "AND" (sum_(i=1)^kappa F_i >= S_text("det") times sigma_text("RMS"))$
+  Catalog records are sorted hierarchically starting with 1-sources, then 2-sources, 3-sources, ..., $n$-sources.
+
+== Extraction Strategy Flowchart
+
+```text
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           Raw 2D FITS Image                             │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 1. Background Estimation: Median μ  &  Noise σ_RMS = 1.4826 × MAD       │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 2. PSF Matched Filter: I_filt = [ (I - μ) ★ PSF ]  (Optimal SNR Boost)  │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 3. Subcomponent Photometry: Peak Finding + Sub-Pixel Centroid + Flux F_i│
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 4. Proximity Graph Clustering: Connected Components with R ≤ R_max      │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 5. Physical Validation:                                                 │
+│    • For κ = 1: Flux ≥ 3×RMS (Point Source Detection)                   │
+│    • For κ ≥ 2: (Each F_i < 3×RMS) AND (∑ F_i ≥ 3×RMS) (Coherent Sum)   │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 6. Hierarchical Catalog Output: 1-src → 2-src → 3-src → ... → n-src     │
+│    Multi-Extension FITS Table (.extracted.fits) + DS9 Overlay (.reg)    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
 == Command-Line Parameters
 
 #table(

@@ -44,6 +44,14 @@ pub struct ExtractCli {
     #[arg(long = "psf-auto", alias = "auto-psf", default_value_t = false)]
     pub psf_auto: bool,
 
+    /// Target minimum SNR for point sources used in auto-PSF estimation (e.g. 20.0 for SNR > 20)
+    #[arg(long = "min-psf-snr", default_value_t = 20.0)]
+    pub min_psf_snr: f32,
+
+    /// Maximum number of brightest sources to sample for auto-PSF calibration (default: 20)
+    #[arg(long = "psf-samples", default_value_t = 20)]
+    pub psf_samples: usize,
+
     /// Minimum SNR for individual candidate subcomponent peaks inside a search radius
     #[arg(long, default_value_t = 1.2)]
     pub min_sub_snr: f32,
@@ -122,17 +130,19 @@ fn estimate_background_and_rms(data: &[f32]) -> (f32, f32) {
     (median, rms)
 }
 
-/// Automatically estimate PSF FWHM by fitting 2D intensity moments to bright isolated point sources
+/// Automatically estimate PSF FWHM by fitting 2D intensity moments to bright isolated point sources (SNR > 20 or top 20 brightest)
 fn estimate_psf_fwhm_auto(
     data: &[f32],
     width: usize,
     height: usize,
     bg_median: f32,
     bg_rms: f32,
-) -> Option<(f32, usize)> {
-    let min_peak_val = bg_median + 2.5 * bg_rms;
-    let stamp_radius: isize = 8;
+    min_psf_snr: f32,
+    max_samples: usize,
+) -> Option<(f32, usize, &'static str)> {
+    let base_thresh = bg_median + 2.5 * bg_rms;
     let min_sep: isize = 12;
+    let stamp_radius: isize = 8;
 
     // 1. Gather all prominent local maxima
     let mut candidate_peaks = Vec::new();
@@ -140,7 +150,7 @@ fn estimate_psf_fwhm_auto(
         let row_offset = y * width;
         for x in (min_sep as usize)..(width - min_sep as usize) {
             let val = data[row_offset + x];
-            if val < min_peak_val {
+            if val < base_thresh {
                 continue;
             }
 
@@ -163,7 +173,8 @@ fn estimate_psf_fwhm_auto(
             }
 
             if is_max {
-                candidate_peaks.push((x, y, val - bg_median));
+                let snr = (val - bg_median) / bg_rms;
+                candidate_peaks.push((x, y, snr));
             }
         }
     }
@@ -172,13 +183,21 @@ fn estimate_psf_fwhm_auto(
         return None;
     }
 
-    // 2. Sort by peak intensity descending (brightest stars first)
+    // 2. Select peaks: either SNR >= min_psf_snr (e.g. > 20) or top 20 brightest
     candidate_peaks.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-    let top_sample_count = candidate_peaks.len().min(100);
+
+    let high_snr_peaks: Vec<_> = candidate_peaks.iter().copied().filter(|p| p.2 >= min_psf_snr).collect();
+    let (selected_peaks, mode_str) = if !high_snr_peaks.is_empty() {
+        let limit = high_snr_peaks.len().min(max_samples);
+        (&high_snr_peaks[..limit], "SNR > 20.0 (high-significance stars)")
+    } else {
+        let limit = candidate_peaks.len().min(max_samples);
+        (&candidate_peaks[..limit], "top 20 brightest sources")
+    };
 
     let mut fwhm_samples = Vec::new();
 
-    for &(x, y, _) in &candidate_peaks[..top_sample_count] {
+    for &(x, y, _) in selected_peaks {
         let mut sum_i = 0.0f32;
         let mut sum_ix = 0.0f32;
         let mut sum_iy = 0.0f32;
@@ -241,7 +260,7 @@ fn estimate_psf_fwhm_auto(
     } else {
         fwhm_samples.sort_by(|a, b| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal));
         let median_fwhm = fwhm_samples[fwhm_samples.len() / 2];
-        Some((median_fwhm, fwhm_samples.len()))
+        Some((median_fwhm, fwhm_samples.len(), mode_str))
     }
 }
 
@@ -1052,15 +1071,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2b. Automatically estimate PSF FWHM if requested or fwhm <= 0
     let effective_fwhm = if args.psf_auto || args.fwhm <= 0.0 {
-        println!("Estimating PSF FWHM automatically from bright isolated point sources (--psf-auto)...");
-        match estimate_psf_fwhm_auto(&fits_img.data, fits_img.width, fits_img.height, bg_median, bg_rms) {
-            Some((measured_fwhm, count)) => {
-                println!("Auto-PSF: Measured median FWHM = {:.2} pixels from {} bright point sources.", measured_fwhm, count);
+        println!("Estimating PSF FWHM automatically from bright point sources (SNR > {:.1} or top {} stars)...", args.min_psf_snr, args.psf_samples);
+        match estimate_psf_fwhm_auto(&fits_img.data, fits_img.width, fits_img.height, bg_median, bg_rms, args.min_psf_snr, args.psf_samples) {
+            Some((measured_fwhm, count, mode)) => {
+                println!("Auto-PSF: Measured median FWHM = {:.2} pixels from {} sources (using {}).", measured_fwhm, count, mode);
                 measured_fwhm
             }
             None => {
                 let fallback = if args.fwhm > 0.0 { args.fwhm } else { 10.0 };
-                println!("Auto-PSF: No bright isolated stars found for calibration. Falling back to default FWHM = {:.1} px.", fallback);
+                println!("Auto-PSF: No isolated stars found for calibration. Falling back to default FWHM = {:.1} px.", fallback);
                 fallback
             }
         }

@@ -267,9 +267,10 @@ Extracting $kappa$-sources from a noisy astronomical raster requires solving a d
 
 To prevent accidental overwrites and keep session records organized, `kappa_extract.bin` automatically writes timestamped catalog products using the format `<fitsname>_<YYYYMMDD_HHMMSS>`:
 
-- *FITS Catalog* (`<fitsname>_<timestamp>.extracted.fits`): Binary table HDU with full 32-bit float columns (`KAPPA_ID`, `KAPPA`, `CEN_X`, `CEN_Y`, `TOTAL_FLUX`, `MAX_AMP`, `RADIUS`, `SNR`, `N_MEMBERS`).
-- *ASCII Table* (`<fitsname>_<timestamp>.extracted.cat`): Plain text table with metadata header cards and aligned columns.
+- *Primary FITS Catalog* (`<fitsname>_<timestamp>.extracted.fits`): Binary table HDU with full columns (`KAPPA_ID`, `KAPPA`, `CEN_X`, `CEN_Y`, `TOTAL_FLUX`, `MAX_AMP`, `RADIUS`, `SNR`, `N_MEMBERS`).
+- *ASCII Catalog* (`<fitsname>_<timestamp>.extracted.cat`): Plain text table of extracted $kappa$-sources with metadata header cards and aligned columns.
 - *CSV Catalog* (`<fitsname>_<timestamp>.extracted.csv`): Comma-separated format for direct loading into Pandas, Astropy, or Excel.
+- *Constituent Subcomponents Catalog* (`<fitsname>_<timestamp>.extracted.subcomponents.cat` & `.csv`): Table of member point sources mapped to their parent `KAPPA_ID`. Unassociated candidate noise peaks ($kappa = 0$) are strictly excluded.
 - *DS9 Region File* (`<fitsname>_<timestamp>.extracted.reg`): Color-coded region overlay.
 
 == Command-Line Parameters
@@ -285,7 +286,9 @@ To prevent accidental overwrites and keep session records organized, `kappa_extr
   [`--detection-sigma`], [`-s`], [`3.0`], [Collective flux detection threshold ($>= S times "Beam RMS"$)],
   [`--search-radius`], [`-r`], [`25.0`], [Search radius $R_text("search")$ in pixels from centroid],
   [`--fwhm`], [], [`10.0`], [Estimated PSF FWHM in pixels (set 0 or use `--psf-auto` for auto mode)],
-  [`--psf-auto`], [], [`false`], [Automatically measure PSF FWHM from bright isolated point sources],
+  [`--psf-auto`], [], [`false`], [Automatically measure PSF FWHM from bright point sources],
+  [`--min-psf-snr`], [], [`20.0`], [Target minimum SNR for auto-PSF calibration stars],
+  [`--psf-samples`], [], [`20`], [Maximum number of brightest sources to sample for auto-PSF],
   [`--min-sub-snr`], [], [`1.2`], [Minimum candidate peak SNR for subcomponents in matched filter],
   [`--seed-snr`], [], [`2.2`], [Candidate cluster seed threshold on smoothed map (alias: `--peak-snr`)],
   [`--output`], [`-o`], [`<auto>`], [Custom output FITS catalog path (defaults to timestamped name)],
@@ -298,8 +301,30 @@ To prevent accidental overwrites and keep session records organized, `kappa_extr
 ./kappa_extract.bin test.fits --psf-auto -s 3.0 -r 25.0
 
 # 2. Extract with known FWHM and 5xRMS detection threshold:
-./kappa_extract.bin test.fits --fwhm 10.0 -s 5.0 -r 30.0
+./kappa_extract.bin test.fits --fwhm 8.7 -s 5.0 -r 25.0
+
+# 3. Cross-match and benchmark recovery against ground-truth simulation:
+python3 compare_kappa.py test.fits
 ```
+
+#v(1em)
+
+= Empirical Recovery Benchmark
+
+The table below summarizes the recovery performance of `kappa_extract.bin` on a mock $2048 times 2048$ image with 50 injected $kappa$-sources ($1 <= kappa <= 4$) convolved by a Gaussian PSF ($"FWHM" = 8.7" px"$, $sigma_text("noise") = 1.0$):
+
+#table(
+  columns: (2fr, 1.5fr, 1.8fr, 1.8fr, 2fr, 2fr),
+  fill: (col, row) => if row == 0 { rgb("#e2e8f0") } else if calc.even(row) { rgb("#f8fafc") } else { white },
+  stroke: 0.5pt + rgb("#cbd5e1"),
+  align: (center, center, center, center, center, center),
+  [Multiplicity], [Injected], [Recovered (Auto)], [Recovered (Exact)], [Mean Offset], [Flux Ratio (Ext/Tr)],
+  [1-sources], [10], [8 (80.0%)], [8 (80.0%)], [2.68 px], [1.057#sym.times],
+  [2-sources], [19], [15 (78.9%)], [16 (84.2%)], [8.18 px], [1.098#sym.times],
+  [3-sources], [10], [6 (60.0%)], [6 (60.0%)], [9.13 px], [0.864#sym.times],
+  [4-sources], [11], [7 (63.6%)], [7 (63.6%)], [10.24 px], [2.250#sym.times],
+  [*Total / Median*], [*50*], [*36 (72.0%)*], [*37 (74.0%)*], [*6.34 px*], [*0.986#sym.times*],
+)
 
 #v(1em)
 
@@ -330,6 +355,10 @@ with fits.open("test.extracted.fits") as hdul:
     print(f"Total kappa-sources extracted: {len(ktable)}")
     for row in ktable[:5]:
         print(f"ID={row['KAPPA_ID']}: kappa={row['KAPPA']}, Pos=({row['CEN_X']:.1f}, {row['CEN_Y']:.1f}), Flux={row['TOTAL_FLUX']:.3f}, SNR={row['SNR']:.1f}")
+
+    # 2. Access constituent subcomponents
+    stable = hdul["SOURCES"].data
+    print(f"Total member subcomponents: {len(stable)}")
 ```
 
 #v(1.5em)

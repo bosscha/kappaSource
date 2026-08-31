@@ -263,6 +263,15 @@ Extracting $kappa$-sources from a noisy astronomical raster requires solving a d
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
+== Output Timestamped Catalog Files
+
+To prevent accidental overwrites and keep session records organized, `kappa_extract.bin` automatically writes timestamped catalog products using the format `<fitsname>_<YYYYMMDD_HHMMSS>`:
+
+- *FITS Catalog* (`<fitsname>_<timestamp>.extracted.fits`): Binary table HDU with full 32-bit float columns (`KAPPA_ID`, `KAPPA`, `CEN_X`, `CEN_Y`, `TOTAL_FLUX`, `MAX_AMP`, `RADIUS`, `SNR`, `N_MEMBERS`).
+- *ASCII Table* (`<fitsname>_<timestamp>.extracted.cat`): Plain text table with metadata header cards and aligned columns.
+- *CSV Catalog* (`<fitsname>_<timestamp>.extracted.csv`): Comma-separated format for direct loading into Pandas, Astropy, or Excel.
+- *DS9 Region File* (`<fitsname>_<timestamp>.extracted.reg`): Color-coded region overlay.
+
 == Command-Line Parameters
 
 #table(
@@ -273,17 +282,18 @@ Extracting $kappa$-sources from a noisy astronomical raster requires solving a d
   [Option], [Short], [Default], [Description],
   [`<INPUT>`], [], [*(required)*], [Path to input FITS image (e.g. `test.fits`)],
   [`--max-kappa`], [`-k`], [`0` *(all)*], [Maximum multiplicity upper limit (e.g. `-k 3` restricts to $kappa <= 3$)],
-  [`--detection-sigma`], [`-s`], [`3.0`], [Collective flux detection threshold ($>= S times "RMS"$)],
-  [`--cluster-radius`], [`-r`], [`25.0`], [Maximum clustering radius in pixels from centroid],
+  [`--detection-sigma`], [`-s`], [`3.0`], [Collective flux detection threshold ($>= S times "Beam RMS"$)],
+  [`--search-radius`], [`-r`], [`25.0`], [Search radius $R_text("search")$ in pixels from centroid],
   [`--fwhm`], [], [`10.0`], [Estimated PSF FWHM in pixels],
-  [`--peak-snr`], [], [`2.5`], [Matched-filter peak SNR threshold for candidate peaks],
-  [`--output`], [`-o`], [`<in>.extracted.fits`], [Output FITS catalog path],
+  [`--min-sub-snr`], [], [`1.2`], [Minimum candidate peak SNR for subcomponents in matched filter],
+  [`--seed-snr`], [], [`2.2`], [Candidate cluster seed threshold on smoothed map (alias: `--peak-snr`)],
+  [`--output`], [`-o`], [`<auto>`], [Custom output FITS catalog path (defaults to timestamped name)],
 )
 
 == Usage Examples
 
 ```bash
-# 1. Standard extraction with 3xRMS threshold and 25 px radius:
+# 1. Standard extraction generating timestamped FITS, ASCII .cat, CSV, and .reg files:
 ./kappa_extract.bin test.fits -s 3.0 -r 25.0
 
 # 2. Extract only up to 3-sources (kappa <= 3) with 5xRMS detection threshold:

@@ -3,6 +3,8 @@
 Compare Ground-Truth Injected kappa-Sources with Extracted kappa-Sources.
 """
 
+import os
+import glob
 import sys
 import argparse
 import numpy as np
@@ -11,7 +13,25 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-def compare_catalogs(truth_fits_path, extracted_fits_path, match_radius_px=25.0, plot_output="comparison_report.png"):
+def find_latest_extracted_file(truth_fits_path):
+    stem = os.path.splitext(os.path.basename(truth_fits_path))[0]
+    parent = os.path.dirname(truth_fits_path) or "."
+    candidates = glob.glob(os.path.join(parent, f"{stem}_*.extracted.fits"))
+    if candidates:
+        candidates.sort(key=os.path.getmtime, reverse=True)
+        return candidates[0]
+    generic = os.path.join(parent, f"{stem}.extracted.fits")
+    if os.path.exists(generic):
+        return generic
+    return None
+
+def compare_catalogs(truth_fits_path, extracted_fits_path=None, match_radius_px=25.0, plot_output="comparison_report.png"):
+    if extracted_fits_path is None:
+        extracted_fits_path = find_latest_extracted_file(truth_fits_path)
+        if extracted_fits_path is None:
+            print(f"Error: Could not find any extracted catalog matching {truth_fits_path}")
+            sys.exit(1)
+
     print("=" * 80)
     print("KAPPA-SOURCE BENCHMARK: Injected Ground Truth vs. Extracted Catalog")
     print("=" * 80)
@@ -188,7 +208,7 @@ def compare_catalogs(truth_fits_path, extracted_fits_path, match_radius_px=25.0,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compare Injected vs Extracted kappa-Sources")
     parser.add_argument("truth", help="Path to ground truth mock FITS file (e.g. mock_image.fits)")
-    parser.add_argument("extracted", help="Path to extracted catalog FITS file (e.g. mock_image.extracted.fits)")
+    parser.add_argument("extracted", nargs="?", default=None, help="Path to extracted catalog FITS file (default: auto-detect latest timestamped catalog)")
     parser.add_argument("-r", "--radius", type=float, default=25.0, help="Positional match radius in pixels (default: 25.0)")
     parser.add_argument("-p", "--plot", default="comparison_report.png", help="Output PNG path for diagnostic figures")
     args = parser.parse_args()

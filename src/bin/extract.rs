@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use clap::Parser;
 
 #[path = "../fits.rs"]
@@ -19,7 +20,7 @@ pub struct ExtractCli {
     #[arg(required = true)]
     pub input: PathBuf,
 
-    /// Output extracted catalog FITS file (default: <input>.extracted.fits)
+    /// Output extracted catalog FITS file (default: <fitsname>_<timestamp>.extracted.fits)
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 
@@ -54,6 +55,47 @@ pub struct ExtractCli {
     /// Also generate a DS9 region overlay file (.reg)
     #[arg(long, default_value_t = true)]
     pub save_regions: bool,
+
+    /// Also generate an ASCII / CSV text catalog (.cat and .csv)
+    #[arg(long, default_value_t = true)]
+    pub save_ascii: bool,
+}
+
+/// Generate UTC date-time timestamp string in format YYYYMMDD_HHMMSS
+fn get_current_timestamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let secs_per_day = 86400;
+    let days = now / secs_per_day;
+    let rem_secs = now % secs_per_day;
+    let hours = rem_secs / 3600;
+    let mins = (rem_secs % 3600) / 60;
+    let secs = rem_secs % 60;
+
+    let mut year = 1970;
+    let mut d = days;
+    loop {
+        let leap = if (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0) { 1 } else { 0 };
+        let days_in_year = 365 + leap;
+        if d < days_in_year {
+            let month_days = [31, 28 + leap, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+            let mut month = 1;
+            for &md in &month_days {
+                if d < md {
+                    break;
+                }
+                d -= md;
+                month += 1;
+            }
+            let day = d + 1;
+            return format!("{:04}{:02}{:02}_{:02}{:02}{:02}", year, month, day, hours, mins, secs);
+        }
+        d -= days_in_year;
+        year += 1;
+    }
 }
 
 /// Robust background estimation (Median and Median Absolute Deviation -> RMS)
@@ -255,7 +297,7 @@ fn extract_kappa_two_pass(
             let sx = s.x;
             let sy = s.y;
 
-            // Lock all nearby sub-threshold peaks within 1 beam FWHM so they are not stolen
+            // Lock all nearby sub-threshold peaks within 1 beam FWHM
             let beam_lock_sq = (fwhm * 0.8) * (fwhm * 0.8);
             for j in 0..sub_peaks.len() {
                 if !used_sub[j] {
@@ -318,7 +360,6 @@ fn extract_kappa_two_pass(
             }
         }
 
-        // Multi-component kappa-sources require at least 2 subcomponents
         if member_indices.len() < 2 {
             continue;
         }
@@ -502,8 +543,60 @@ fn print_extraction_report(
     println!("--------------------------------------------------------------------------------");
 }
 
+/// Write formatted ASCII table catalog (.cat)
+fn write_ascii_catalog(
+    path: &Path,
+    input_filename: &str,
+    timestamp: &str,
+    kappa_sources: &[KappaSource],
+    bg_median: f32,
+    bg_rms: f32,
+    beam_flux_rms: f32,
+    detection_sigma: f32,
+) -> std::io::Result<()> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    writeln!(writer, "# ==============================================================================")?;
+    writeln!(writer, "# kappa-Source Extracted Catalog")?;
+    writeln!(writer, "# Input FITS File   : {}", input_filename)?;
+    writeln!(writer, "# Extraction Date   : {}", timestamp)?;
+    writeln!(writer, "# Background Median : {:.6}", bg_median)?;
+    writeln!(writer, "# Background RMS    : {:.6}", bg_rms)?;
+    writeln!(writer, "# Beam Flux RMS     : {:.6}", beam_flux_rms)?;
+    writeln!(writer, "# Detection Sigma   : {:.2} (Total Flux >= {:.4})", detection_sigma, detection_sigma * beam_flux_rms)?;
+    writeln!(writer, "# Total Extracted   : {}", kappa_sources.len())?;
+    writeln!(writer, "# ==============================================================================")?;
+    writeln!(writer, "#{:<7} {:<6} {:<10} {:<10} {:<14} {:<12} {:<12} {:<10} {:<10} {:<20}",
+        "KAPPA_ID", "KAPPA", "CEN_X", "CEN_Y", "TOTAL_FLUX", "MAX_AMP", "RADIUS_PX", "SNR", "N_MEMBERS", "MEMBER_IDS")?;
+    writeln!(writer, "# ------------------------------------------------------------------------------")?;
+
+    for ks in kappa_sources {
+        let members_str: String = ks.member_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        writeln!(writer, "{:<8} {:<6} {:<10.3} {:<10.3} {:<14.4} {:<12.4} {:<12.2} {:<10.2} {:<10} {:<20}",
+            ks.id, ks.kappa, ks.centroid_x, ks.centroid_y, ks.total_flux, ks.max_amplitude, ks.radius, ks.snr, ks.member_ids.len(), members_str)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Write CSV formatted catalog (.csv)
+fn write_csv_catalog(
+    path: &Path,
+    kappa_sources: &[KappaSource],
+) -> std::io::Result<()> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    writeln!(writer, "kappa_id,kappa,cen_x,cen_y,total_flux,max_amplitude,radius_px,snr,n_members,member_ids")?;
+
+    for ks in kappa_sources {
+        let members_str: String = ks.member_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(";");
+        writeln!(writer, "{},{},{:.4},{:.4},{:.6},{:.6},{:.4},{:.4},{},\"{}\"",
+            ks.id, ks.kappa, ks.centroid_x, ks.centroid_y, ks.total_flux, ks.max_amplitude, ks.radius, ks.snr, ks.member_ids.len(), members_str)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 /// Write DS9 region file for visual validation
-fn write_ds9_regions(path: &PathBuf, kappa_sources: &[KappaSource], sources: &[Source]) -> std::io::Result<()> {
+fn write_ds9_regions(path: &Path, kappa_sources: &[KappaSource], sources: &[Source]) -> std::io::Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
     writeln!(writer, "# Region file format: DS9 version 4.1")?;
     writeln!(writer, "global font=\"helvetica 10 bold roman\" select=1 highlite=1 dash=0 fixed=0 edit=1 move=1 delete=1 include=1 source=1")?;
@@ -576,7 +669,7 @@ fn fits_str_val(s: &str) -> String {
 
 /// Write extracted kappa-sources catalog to FITS binary table
 fn write_extracted_fits_catalog(
-    path: &PathBuf,
+    path: &Path,
     kappa_sources: &[KappaSource],
     _sources: &[Source],
     bg_median: f32,
@@ -687,11 +780,27 @@ fn write_extracted_fits_catalog(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = ExtractCli::parse();
+    let timestamp = get_current_timestamp();
+
+    let input_stem = args
+        .input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("image");
+
+    let input_filename = args
+        .input
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("image.fits");
+
+    let parent_dir = args.input.parent().unwrap_or_else(|| Path::new("."));
 
     println!("==============================================================================");
     println!("kappa-Source Two-Pass Hierarchical Extractor (kappa_extract.bin)");
     println!("==============================================================================");
     println!("Input FITS File      : {}", args.input.display());
+    println!("Timestamp Session    : {}", timestamp);
     println!("Search Radius (R_src): <= {:.1} pixels", args.search_radius);
     println!("Detection Threshold  : Total Flux >= {:.2} * Beam RMS", args.detection_sigma);
     println!("Subcomponent Min SNR : Peak SNR >= {:.2} in matched filter", args.min_sub_snr);
@@ -743,23 +852,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.max_kappa,
     );
 
-    // 5. Save extracted catalog to FITS
-    let out_fits_path = args.output.unwrap_or_else(|| {
-        let mut p = args.input.clone();
-        p.set_extension("extracted.fits");
-        p
-    });
-    println!("Writing extracted catalog to {}...", out_fits_path.display());
-    write_extracted_fits_catalog(&out_fits_path, &kappa_sources, &sources, bg_median, bg_rms, beam_flux_rms, args.detection_sigma)?;
+    // 5. Determine timestamped output filenames
+    let default_fits_name = format!("{}_{}.extracted.fits", input_stem, timestamp);
+    let out_fits_path = args.output.unwrap_or_else(|| parent_dir.join(&default_fits_name));
 
-    // 6. Save DS9 region overlay
-    if args.save_regions {
-        let mut reg_path = out_fits_path.clone();
-        reg_path.set_extension("reg");
-        println!("Writing DS9 region overlay to {}...", reg_path.display());
-        write_ds9_regions(&reg_path, &kappa_sources, &sources)?;
+    // Also write standard generic link / file <stem>.extracted.fits for script convenience
+    let generic_fits_path = parent_dir.join(format!("{}.extracted.fits", input_stem));
+
+    println!("Writing timestamped FITS catalog to {}...", out_fits_path.display());
+    write_extracted_fits_catalog(&out_fits_path, &kappa_sources, &sources, bg_median, bg_rms, beam_flux_rms, args.detection_sigma)?;
+    if out_fits_path != generic_fits_path {
+        let _ = write_extracted_fits_catalog(&generic_fits_path, &kappa_sources, &sources, bg_median, bg_rms, beam_flux_rms, args.detection_sigma);
     }
 
-    println!("Extraction complete! Successfully processed {}.", args.input.display());
+    // 6. Save ASCII and CSV text catalogs
+    if args.save_ascii {
+        let cat_path = parent_dir.join(format!("{}_{}.extracted.cat", input_stem, timestamp));
+        let csv_path = parent_dir.join(format!("{}_{}.extracted.csv", input_stem, timestamp));
+        println!("Writing ASCII catalog to {}...", cat_path.display());
+        write_ascii_catalog(&cat_path, input_filename, &timestamp, &kappa_sources, bg_median, bg_rms, beam_flux_rms, args.detection_sigma)?;
+        println!("Writing CSV catalog to {}...", csv_path.display());
+        write_csv_catalog(&csv_path, &kappa_sources)?;
+    }
+
+    // 7. Save DS9 region overlays
+    if args.save_regions {
+        let timestamped_reg = parent_dir.join(format!("{}_{}.extracted.reg", input_stem, timestamp));
+        let generic_reg = parent_dir.join(format!("{}.extracted.reg", input_stem));
+        println!("Writing DS9 region overlay to {}...", timestamped_reg.display());
+        write_ds9_regions(&timestamped_reg, &kappa_sources, &sources)?;
+        if timestamped_reg != generic_reg {
+            let _ = write_ds9_regions(&generic_reg, &kappa_sources, &sources);
+        }
+    }
+
+    println!("Extraction complete! Successfully created timestamped catalog for {}.", args.input.display());
     Ok(())
 }

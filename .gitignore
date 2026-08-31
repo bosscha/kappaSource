@@ -2,10 +2,13 @@
 target/
 *.bin
 
-# Large mock / test FITS files
+# Large mock / test FITS files & extraction outputs
 *.fits
 *.fits.gz
 *.reg
+*.cat
+*.csv
+*.png
 
 # Editor and OS
 .DS_Store

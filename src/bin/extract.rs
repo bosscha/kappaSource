@@ -11,7 +11,7 @@ mod kappa;
 use fits::read_fits_image;
 use kappa::{KappaSource, Source};
 
-/// Extract kappa-sources from a 2D FITS astronomical image using multi-scale search radius
+/// Extract kappa-sources from a 2D FITS astronomical image using two-pass multi-scale search radius
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct ExtractCli {
@@ -40,11 +40,11 @@ pub struct ExtractCli {
     pub fwhm: f32,
 
     /// Minimum SNR for individual candidate subcomponent peaks inside a search radius
-    #[arg(long, default_value_t = 1.5)]
+    #[arg(long, default_value_t = 1.2)]
     pub min_sub_snr: f32,
 
     /// Candidate seed detection threshold in SNR units (alias: --peak-snr)
-    #[arg(long = "seed-snr", alias = "peak-snr", default_value_t = 2.5)]
+    #[arg(long = "seed-snr", alias = "peak-snr", default_value_t = 2.2)]
     pub seed_snr: f32,
 
     /// Maximum individual flux for a single subcomponent in kappa >= 2 (in units of beam RMS)
@@ -140,8 +140,8 @@ struct Seed {
     snr: f32,
 }
 
-/// Advanced Multi-Scale Search Radius Extraction Engine
-fn extract_kappa_with_search_radius(
+/// Two-Pass Hierarchical Search Radius Extraction Engine
+fn extract_kappa_two_pass(
     raw_data: &[f32],
     width: usize,
     height: usize,
@@ -200,7 +200,6 @@ fn extract_kappa_with_search_radius(
             }
 
             if is_local_max {
-                // Parabolic sub-pixel centroid
                 let v_c = val;
                 let v_l = point_filt[py_idx(y, 0) * width + (x - 1)];
                 let v_r = point_filt[py_idx(y, 0) * width + (x + 1)];
@@ -239,53 +238,78 @@ fn extract_kappa_with_search_radius(
         }
     }
 
-    // 4. Multi-scale candidate seeds
-    let seed_sep = search_radius.round().max(10.0) as isize;
-    let min_p_seed = seed_snr_thresh * point_filt_rms;
+    let mut used_sub = vec![false; sub_peaks.len()];
+    let mut kappa_sources: Vec<KappaSource> = Vec::new();
+    let min_detection_flux = detection_sigma * beam_flux_rms;
+    let max_sub_flux = subcomponent_max_sigma * beam_flux_rms;
+
+    // =========================================================================
+    // PASS 1: Extract all genuine 1-sources (subcomponents with Flux >= detection_sigma * beam_rms)
+    // =========================================================================
+    for i in 0..sub_peaks.len() {
+        if !used_sub[i] && sub_peaks[i].flux >= min_detection_flux {
+            let s = &sub_peaks[i];
+            let snr = s.flux / beam_flux_rms;
+
+            used_sub[i] = true;
+            let sx = s.x;
+            let sy = s.y;
+
+            // Lock all nearby sub-threshold peaks within 1 beam FWHM so they are not stolen
+            let beam_lock_sq = (fwhm * 0.8) * (fwhm * 0.8);
+            for j in 0..sub_peaks.len() {
+                if !used_sub[j] {
+                    let dx = sub_peaks[j].x - sx;
+                    let dy = sub_peaks[j].y - sy;
+                    if dx * dx + dy * dy <= beam_lock_sq {
+                        used_sub[j] = true;
+                    }
+                }
+            }
+
+            kappa_sources.push(KappaSource {
+                id: 0,
+                kappa: 1,
+                member_ids: vec![s.id],
+                centroid_x: s.x,
+                centroid_y: s.y,
+                total_flux: s.flux,
+                max_amplitude: s.amplitude,
+                radius: fwhm / 2.0,
+                snr,
+            });
+        }
+    }
+
+    // =========================================================================
+    // PASS 2: Extract multi-component kappa-sources (kappa >= 2) from sub-threshold peaks
+    // =========================================================================
+    let seed_sep = (search_radius * 0.6).round().max(10.0) as isize;
     let min_c_seed = seed_snr_thresh * cluster_filt_rms;
 
     let mut seeds = Vec::new();
     for y in seed_sep as usize..(height - seed_sep as usize) {
         let row_offset = y * width;
         for x in seed_sep as usize..(width - seed_sep as usize) {
-            let p_val = point_filt[row_offset + x];
             let c_val = cluster_filt[row_offset + x];
-
-            let p_snr = p_val / point_filt_rms;
             let c_snr = c_val / cluster_filt_rms;
-            let max_snr = p_snr.max(c_snr);
 
-            if max_snr < seed_snr_thresh {
-                continue;
-            }
-
-            let is_p_max = p_val >= min_p_seed && check_local_max(&point_filt, width, height, x, y, (fwhm * 0.8) as isize);
-            let is_c_max = c_val >= min_c_seed && check_local_max(&cluster_filt, width, height, x, y, (search_radius * 0.7) as isize);
-
-            if is_p_max || is_c_max {
-                seeds.push(Seed { x, y, snr: max_snr });
+            if c_val >= min_c_seed && check_local_max(&cluster_filt, width, height, x, y, (search_radius * 0.6) as isize) {
+                seeds.push(Seed { x, y, snr: c_snr });
             }
         }
     }
 
-    // Sort seeds by decreasing significance
     seeds.sort_by(|a, b| b.snr.partial_cmp(&a.snr).unwrap_or(std::cmp::Ordering::Equal));
-
-    // 5. Centroid-Bounded Search Radius Cluster Extraction
-    let mut used_sub = vec![false; sub_peaks.len()];
-    let mut kappa_sources: Vec<KappaSource> = Vec::new();
-    let min_detection_flux = detection_sigma * beam_flux_rms;
-    let max_sub_flux = subcomponent_max_sigma * beam_flux_rms;
     let search_rad_sq = search_radius * search_radius;
 
     for seed in seeds {
         let sx = seed.x as f32;
         let sy = seed.y as f32;
 
-        // Gather all unused subcomponents within search radius of this seed
         let mut member_indices = Vec::new();
         for (i, s) in sub_peaks.iter().enumerate() {
-            if !used_sub[i] {
+            if !used_sub[i] && s.flux < max_sub_flux {
                 let dx = s.x - sx;
                 let dy = s.y - sy;
                 if dx * dx + dy * dy <= search_rad_sq {
@@ -294,16 +318,15 @@ fn extract_kappa_with_search_radius(
             }
         }
 
-        if member_indices.is_empty() {
+        // Multi-component kappa-sources require at least 2 subcomponents
+        if member_indices.len() < 2 {
             continue;
         }
 
-        // Compute total flux & flux-weighted centroid
         let mut total_flux = 0.0f32;
         let mut weighted_x = 0.0f32;
         let mut weighted_y = 0.0f32;
         let mut max_amp = 0.0f32;
-        let mut all_sub_subthresh = true;
 
         for &idx in &member_indices {
             let s = &sub_peaks[idx];
@@ -313,15 +336,11 @@ fn extract_kappa_with_search_radius(
             if s.amplitude > max_amp {
                 max_amp = s.amplitude;
             }
-            if member_indices.len() >= 2 && s.flux >= max_sub_flux {
-                all_sub_subthresh = false;
-            }
         }
 
         let cen_x = weighted_x / total_flux;
         let cen_y = weighted_y / total_flux;
 
-        // Strict Centroid-Bounded verification: ensure all members are within search_radius from common centroid
         let mut verified_indices = Vec::new();
         let mut verified_total_flux = 0.0f32;
         let mut max_r_sq = 0.0f32;
@@ -341,18 +360,12 @@ fn extract_kappa_with_search_radius(
         }
 
         let kappa = verified_indices.len();
-        if kappa == 0 || (max_kappa > 0 && kappa > max_kappa) {
+        if kappa < 2 || (max_kappa > 0 && kappa > max_kappa) {
             continue;
         }
 
         let radius = max_r_sq.sqrt() + fwhm / 2.0;
-        let is_valid = if kappa == 1 {
-            verified_total_flux >= min_detection_flux
-        } else {
-            verified_total_flux >= min_detection_flux && all_sub_subthresh && radius <= search_radius * 1.5
-        };
-
-        if is_valid {
+        if verified_total_flux >= min_detection_flux && radius <= search_radius * 1.5 {
             for &idx in &verified_indices {
                 used_sub[idx] = true;
             }
@@ -676,7 +689,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = ExtractCli::parse();
 
     println!("==============================================================================");
-    println!("kappa-Source Multi-Scale Search Radius Extractor (kappa_extract.bin)");
+    println!("kappa-Source Two-Pass Hierarchical Extractor (kappa_extract.bin)");
     println!("==============================================================================");
     println!("Input FITS File      : {}", args.input.display());
     println!("Search Radius (R_src): <= {:.1} pixels", args.search_radius);
@@ -701,9 +714,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Estimating background and RMS noise level...");
     let (bg_median, bg_rms) = estimate_background_and_rms(&fits_img.data);
 
-    // 3. Extract kappa-sources with multi-scale search radius
-    println!("Running Multi-Scale Search Radius Extraction Engine...");
-    let (kappa_sources, sources, beam_flux_rms) = extract_kappa_with_search_radius(
+    // 3. Extract kappa-sources with two-pass hierarchical engine
+    println!("Running Two-Pass Hierarchical Extraction (1-sources first, then multi-sources)...");
+    let (kappa_sources, sources, beam_flux_rms) = extract_kappa_two_pass(
         &fits_img.data,
         fits_img.width,
         fits_img.height,

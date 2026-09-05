@@ -55,6 +55,7 @@ cargo build --release
 Binaries:
 - `target/release/kappa_generate` (`./kappa_generate.bin`)
 - `target/release/kappa_extract` (`./kappa_extract.bin`)
+- `target/release/kappa_extract_gpu` (`./kappa_extract_gpu.bin`) [Radeon 8060S / Vulkan GPU accelerated]
 
 ---
 
@@ -87,7 +88,10 @@ Binaries:
 # Auto-PSF mode (measures seeing directly from bright stars):
 ./kappa_extract.bin mock_image.fits --psf-auto -s 3.0 -r 25.0
 
-# Known PSF mode:
+# GPU-accelerated mode on AMD Radeon 8060S / Vulkan:
+./kappa_extract_gpu.bin mock_image.fits --fwhm 8.7 -s 3.0 -r 25.0
+
+# Standard CPU mode:
 ./kappa_extract.bin mock_image.fits --fwhm 8.7 -s 3.0 -r 25.0
 ```
 

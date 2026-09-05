@@ -374,11 +374,12 @@ impl GpuContext {
         let adapter_name = info.name;
         let backend_name = format!("{:?}", info.backend);
 
+        let limits = adapter.limits();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("KappaGpuDevice"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 ..Default::default()
             })
@@ -470,31 +471,16 @@ impl GpuContext {
         })
     }
 
-    /// Perform GPU-accelerated 2D separable Gaussian convolution
-    fn convolve_2d_separable(
+    /// Convolve a single tile or full image buffer on GPU
+    fn convolve_tile(
         &self,
-        raw_data: &[f32],
+        tile_data: &[f32],
         width: usize,
         height: usize,
-        sigma: f32,
+        radius: isize,
+        kernel: &[f32],
         bg_median: f32,
-    ) -> Result<(Vec<f32>, f32, f64), Box<dyn std::error::Error>> {
-        let t_start = Instant::now();
-        let radius = (3.0 * sigma).ceil() as isize;
-        let mut kernel = Vec::new();
-        let two_sigma_sq = 2.0 * sigma * sigma;
-
-        for i in -radius..=radius {
-            kernel.push((-((i * i) as f32) / two_sigma_sq).exp());
-        }
-        let k_sum: f32 = kernel.iter().sum();
-        for k in &mut kernel {
-            *k /= k_sum;
-        }
-
-        let k_sum_sq_1d: f32 = kernel.iter().map(|&v| v * v).sum();
-        let k_sum_sq_2d = k_sum_sq_1d * k_sum_sq_1d;
-
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let num_pixels = width * height;
         let buffer_size = (num_pixels * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
 
@@ -517,13 +503,13 @@ impl GpuContext {
 
         let kernel_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("KernelBuf"),
-            contents: bytemuck::cast_slice(&kernel),
+            contents: bytemuck::cast_slice(kernel),
             usage: wgpu::BufferUsages::STORAGE,
         });
 
         let in_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("InputBuf"),
-            contents: bytemuck::cast_slice(raw_data),
+            contents: bytemuck::cast_slice(tile_data),
             usage: wgpu::BufferUsages::STORAGE,
         });
 
@@ -626,6 +612,100 @@ impl GpuContext {
         drop(mapped);
         readback_buf.unmap();
 
+        Ok(result)
+    }
+
+    /// Perform GPU-accelerated 2D separable Gaussian convolution (with auto-tiling for gigapixel images)
+    fn convolve_2d_separable(
+        &self,
+        raw_data: &[f32],
+        width: usize,
+        height: usize,
+        sigma: f32,
+        bg_median: f32,
+        label: &str,
+    ) -> Result<(Vec<f32>, f32, f64), Box<dyn std::error::Error>> {
+        let t_start = Instant::now();
+        let radius = (3.0 * sigma).ceil() as isize;
+        let mut kernel = Vec::new();
+        let two_sigma_sq = 2.0 * sigma * sigma;
+
+        for i in -radius..=radius {
+            kernel.push((-((i * i) as f32) / two_sigma_sq).exp());
+        }
+        let k_sum: f32 = kernel.iter().sum();
+        for k in &mut kernel {
+            *k /= k_sum;
+        }
+
+        let k_sum_sq_1d: f32 = kernel.iter().map(|&v| v * v).sum();
+        let k_sum_sq_2d = k_sum_sq_1d * k_sum_sq_1d;
+
+        let num_pixels = width * height;
+        let buffer_size_bytes = num_pixels * std::mem::size_of::<f32>();
+
+        // Safe tile threshold: 128 MB buffer limit (32 million pixels)
+        let max_safe_tile_bytes = 128 * 1024 * 1024;
+        let result = if buffer_size_bytes <= max_safe_tile_bytes {
+            self.convolve_tile(raw_data, width, height, radius, &kernel, bg_median)?
+        } else {
+            // Tiled GPU processing for large/gigapixel images
+            let tile_size = 2048usize;
+            let mut full_output = vec![0.0f32; num_pixels];
+            let num_tiles_x = (width + tile_size - 1) / tile_size;
+            let num_tiles_y = (height + tile_size - 1) / tile_size;
+            let total_tiles = num_tiles_x * num_tiles_y;
+            let mut tile_idx = 0;
+
+            for y0 in (0..height).step_by(tile_size) {
+                let y1 = (y0 + tile_size).min(height);
+                let out_h = y1 - y0;
+
+                for x0 in (0..width).step_by(tile_size) {
+                    let x1 = (x0 + tile_size).min(width);
+                    let out_w = x1 - x0;
+                    tile_idx += 1;
+
+                    let in_w = out_w + 2 * radius as usize;
+                    let in_h = out_h + 2 * radius as usize;
+                    let mut tile_in = vec![0.0f32; in_w * in_h];
+
+                    // Extract input subgrid with boundary clamping
+                    for ly in 0..in_h {
+                        let iy = (y0 as isize - radius + ly as isize).clamp(0, height as isize - 1) as usize;
+                        let src_row = iy * width;
+                        let dst_row = ly * in_w;
+                        for lx in 0..in_w {
+                            let ix = (x0 as isize - radius + lx as isize).clamp(0, width as isize - 1) as usize;
+                            tile_in[dst_row + lx] = raw_data[src_row + ix];
+                        }
+                    }
+
+                    // Convolve tile on GPU
+                    let tile_out = self.convolve_tile(&tile_in, in_w, in_h, radius, &kernel, bg_median)?;
+
+                    // Copy core output into full output
+                    let r = radius as usize;
+                    for ly in 0..out_h {
+                        let dst_row = (y0 + ly) * width + x0;
+                        let src_row = (ly + r) * in_w + r;
+                        full_output[dst_row..dst_row + out_w]
+                            .copy_from_slice(&tile_out[src_row..src_row + out_w]);
+                    }
+
+                    if total_tiles > 1 && (tile_idx % 10 == 0 || tile_idx == total_tiles) {
+                        print!("\rGPU Tiled [{}] : [{}/{}] tiles ({:.1}%)...", 
+                            label, tile_idx, total_tiles, 100.0 * tile_idx as f32 / total_tiles as f32);
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+            }
+            if total_tiles > 1 {
+                println!();
+            }
+            full_output
+        };
+
         let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
         Ok((result, k_sum_sq_2d, elapsed_ms))
     }
@@ -659,7 +739,7 @@ fn extract_kappa_two_pass_gpu(
 
     // 1. GPU Point-source matched filter
     let (point_filt, k_sum_sq_2d, ms_point) =
-        gpu.convolve_2d_separable(raw_data, width, height, sigma_psf, bg_median)?;
+        gpu.convolve_2d_separable(raw_data, width, height, sigma_psf, bg_median, "Point Filter")?;
     let (_, point_filt_rms) = estimate_background_and_rms(&point_filt);
     let flux_conv_factor = 1.0 / k_sum_sq_2d;
     let beam_flux_rms = point_filt_rms * flux_conv_factor;
@@ -667,7 +747,7 @@ fn extract_kappa_two_pass_gpu(
     // 2. GPU Cluster-scale smoothed filter (matched to search radius extent)
     let sigma_cluster = (sigma_psf * sigma_psf + (search_radius / 2.0) * (search_radius / 2.0)).sqrt();
     let (cluster_filt, _, ms_cluster) =
-        gpu.convolve_2d_separable(raw_data, width, height, sigma_cluster, bg_median)?;
+        gpu.convolve_2d_separable(raw_data, width, height, sigma_cluster, bg_median, "Cluster Filter")?;
     let (_, cluster_filt_rms) = estimate_background_and_rms(&cluster_filt);
 
     println!(
@@ -675,75 +755,83 @@ fn extract_kappa_two_pass_gpu(
         ms_point, ms_cluster, ms_point + ms_cluster
     );
 
-    // 3. Detect candidate subcomponent peaks down to min_sub_snr
+    // 3. Detect candidate subcomponent peaks down to min_sub_snr (Parallelized across CPU threads)
+    use rayon::prelude::*;
     let min_sub_val = min_sub_snr * point_filt_rms;
     let min_peak_sep = (fwhm * 0.45).ceil().max(2.0) as isize;
 
-    let mut sub_peaks: Vec<Source> = Vec::new();
-    let mut sid = 1;
+    let row_indices: Vec<usize> = (min_peak_sep as usize..(height - min_peak_sep as usize)).collect();
+    let raw_peaks: Vec<(f32, f32, f32, f32)> = row_indices
+        .par_iter()
+        .flat_map(|&y| {
+            let row_offset = y * width;
+            let mut local_peaks = Vec::new();
+            for x in min_peak_sep as usize..(width - min_peak_sep as usize) {
+                let val = point_filt[row_offset + x];
+                if val < min_sub_val {
+                    continue;
+                }
 
-    for y in min_peak_sep as usize..(height - min_peak_sep as usize) {
-        let row_offset = y * width;
-        for x in min_peak_sep as usize..(width - min_peak_sep as usize) {
-            let val = point_filt[row_offset + x];
-            if val < min_sub_val {
-                continue;
-            }
-
-            let mut is_local_max = true;
-            for dy in -min_peak_sep..=min_peak_sep {
-                for dx in -min_peak_sep..=min_peak_sep {
-                    if dx == 0 && dy == 0 {
-                        continue;
+                let mut is_local_max = true;
+                for dy in -min_peak_sep..=min_peak_sep {
+                    for dx in -min_peak_sep..=min_peak_sep {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        if point_filt[(y as isize + dy) as usize * width + (x as isize + dx) as usize] > val {
+                            is_local_max = false;
+                            break;
+                        }
                     }
-                    if point_filt[(y as isize + dy) as usize * width + (x as isize + dx) as usize] > val {
-                        is_local_max = false;
+                    if !is_local_max {
                         break;
                     }
                 }
-                if !is_local_max {
-                    break;
+
+                if is_local_max {
+                    let v_c = val;
+                    let v_l = point_filt[py_idx(y, 0) * width + (x - 1)];
+                    let v_r = point_filt[py_idx(y, 0) * width + (x + 1)];
+                    let v_u = point_filt[py_idx(y, -1) * width + x];
+                    let v_d = point_filt[py_idx(y, 1) * width + x];
+
+                    let dx = if (2.0 * v_c - v_l - v_r).abs() > 1e-5 {
+                        0.5 * (v_l - v_r) / (v_l - 2.0 * v_c + v_r)
+                    } else {
+                        0.0
+                    };
+                    let dy = if (2.0 * v_c - v_u - v_d).abs() > 1e-5 {
+                        0.5 * (v_u - v_d) / (v_u - 2.0 * v_c + v_d)
+                    } else {
+                        0.0
+                    };
+
+                    let sub_x = (x as f32 + dx.clamp(-0.8, 0.8)).clamp(0.0, width as f32 - 1.0);
+                    let sub_y = (y as f32 + dy.clamp(-0.8, 0.8)).clamp(0.0, height as f32 - 1.0);
+                    let flux = val * flux_conv_factor;
+                    let amp = flux / (2.0 * std::f32::consts::PI * sigma_psf * sigma_psf);
+                    local_peaks.push((sub_x, sub_y, flux, amp));
                 }
             }
+            local_peaks
+        })
+        .collect();
 
-            if is_local_max {
-                let v_c = val;
-                let v_l = point_filt[py_idx(y, 0) * width + (x - 1)];
-                let v_r = point_filt[py_idx(y, 0) * width + (x + 1)];
-                let v_u = point_filt[py_idx(y, -1) * width + x];
-                let v_d = point_filt[py_idx(y, 1) * width + x];
-
-                let dx = if (2.0 * v_c - v_l - v_r).abs() > 1e-5 {
-                    0.5 * (v_l - v_r) / (v_l - 2.0 * v_c + v_r)
-                } else {
-                    0.0
-                };
-                let dy = if (2.0 * v_c - v_u - v_d).abs() > 1e-5 {
-                    0.5 * (v_u - v_d) / (v_u - 2.0 * v_c + v_d)
-                } else {
-                    0.0
-                };
-
-                let sub_x = (x as f32 + dx.clamp(-0.8, 0.8)).clamp(0.0, width as f32 - 1.0);
-                let sub_y = (y as f32 + dy.clamp(-0.8, 0.8)).clamp(0.0, height as f32 - 1.0);
-                let flux = val * flux_conv_factor;
-                let amp = flux / (2.0 * std::f32::consts::PI * sigma_psf * sigma_psf);
-
-                sub_peaks.push(Source {
-                    id: sid,
-                    x: sub_x,
-                    y: sub_y,
-                    flux,
-                    amplitude: amp,
-                    sigma: sigma_psf,
-                    fwhm,
-                    kappa_id: 0,
-                    kappa: 0,
-                });
-                sid += 1;
-            }
-        }
-    }
+    let mut sub_peaks: Vec<Source> = raw_peaks
+        .into_iter()
+        .enumerate()
+        .map(|(i, (sub_x, sub_y, flux, amp))| Source {
+            id: i + 1,
+            x: sub_x,
+            y: sub_y,
+            flux,
+            amplitude: amp,
+            sigma: sigma_psf,
+            fwhm,
+            kappa_id: 0,
+            kappa: 0,
+        })
+        .collect();
 
     let mut used_sub = vec![false; sub_peaks.len()];
     let mut kappa_sources: Vec<KappaSource> = Vec::new();
@@ -794,18 +882,23 @@ fn extract_kappa_two_pass_gpu(
     let seed_sep = (search_radius * 0.6).round().max(10.0) as isize;
     let min_c_seed = seed_snr_thresh * cluster_filt_rms;
 
-    let mut seeds = Vec::new();
-    for y in seed_sep as usize..(height - seed_sep as usize) {
-        let row_offset = y * width;
-        for x in seed_sep as usize..(width - seed_sep as usize) {
-            let c_val = cluster_filt[row_offset + x];
-            let c_snr = c_val / cluster_filt_rms;
+    let seed_rows: Vec<usize> = (seed_sep as usize..(height - seed_sep as usize)).collect();
+    let mut seeds: Vec<Seed> = seed_rows
+        .par_iter()
+        .flat_map(|&y| {
+            let row_offset = y * width;
+            let mut local_seeds = Vec::new();
+            for x in seed_sep as usize..(width - seed_sep as usize) {
+                let c_val = cluster_filt[row_offset + x];
+                let c_snr = c_val / cluster_filt_rms;
 
-            if c_val >= min_c_seed && check_local_max(&cluster_filt, width, height, x, y, (search_radius * 0.6) as isize) {
-                seeds.push(Seed { x, y, snr: c_snr });
+                if c_val >= min_c_seed && check_local_max(&cluster_filt, width, height, x, y, (search_radius * 0.6) as isize) {
+                    local_seeds.push(Seed { x, y, snr: c_snr });
+                }
             }
-        }
-    }
+            local_seeds
+        })
+        .collect();
 
     seeds.sort_by(|a, b| b.snr.partial_cmp(&a.snr).unwrap_or(std::cmp::Ordering::Equal));
     let search_rad_sq = search_radius * search_radius;
